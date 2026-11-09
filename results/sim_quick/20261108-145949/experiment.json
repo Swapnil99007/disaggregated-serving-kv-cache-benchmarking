@@ -1,0 +1,59 @@
+{
+  "config": {
+    "name": "sim_quick",
+    "deployment": "sim-4w",
+    "router_url": "http://localhost:8000",
+    "model": "kvbench-model",
+    "trace": {
+      "path": "traces/rag_400.jsonl",
+      "workload": "configs/workloads/rag_small.yaml",
+      "max_prompts": 0
+    },
+    "policies": [
+      "round_robin",
+      "least_loaded",
+      "prefix_affinity",
+      "cache_aware"
+    ],
+    "decode_policy": null,
+    "concurrency": [
+      8,
+      16,
+      32,
+      64
+    ],
+    "repeats": 1,
+    "shuffle_policy_order": true,
+    "warmup": {
+      "engine_requests": 8,
+      "prefix_warmup_prompts": 0
+    },
+    "flush_between_runs": true,
+    "request": {
+      "ignore_eos": true,
+      "temperature": 0.0,
+      "timeout_s": 900,
+      "think_time_s": 0.0,
+      "extra_body": {}
+    },
+    "telemetry": {
+      "interval_s": 0.5,
+      "nvml": false
+    },
+    "ready_timeout_s": 900.0,
+    "output_dir": "results",
+    "analysis": {
+      "baseline_policy": "round_robin",
+      "slo_metric": "e2e",
+      "slo_percentile": 95,
+      "slo_target_s": null,
+      "chunk_chars": 256
+    }
+  },
+  "argv": [
+    "/Users/swapnilkannojia/Documents/Projects/llm-serving-benchmarking/.venv/bin/kvbench",
+    "bench",
+    "--experiment",
+    "configs/experiments/sim_quick.yaml"
+  ]
+}

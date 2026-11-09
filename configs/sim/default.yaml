@@ -1,0 +1,22 @@
+# Simulated engine, roughly an L4/A10G-class GPU serving a ~1.5B model.
+# Absolute numbers are not meant to match real hardware; what matters is that the
+# *relative* costs (prefill vs decode, cache hit vs miss, transfer vs recompute) are plausible.
+block_size: 16
+kv_capacity_tokens: 131072        # 8192 blocks; small enough that hot prefixes compete for space
+max_num_seqs: 64
+max_num_batched_tokens: 2048      # chunked-prefill budget per step
+enable_prefix_caching: true
+
+step_overhead_ms: 2.0
+prefill_tokens_per_s: 10000
+decode_weights_ms: 8.0
+decode_kv_ns_per_token: 30.0
+decode_per_seq_ms: 0.05
+
+gpu_mem_gb: 24.0
+weights_gb: 3.1
+kv_bytes_per_token: 28672
+
+transfer_gb_per_s: 25.0           # PCIe-class link for disaggregated KV transfer
+transfer_latency_ms: 2.0
+speed: 1.0

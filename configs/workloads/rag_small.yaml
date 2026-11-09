@@ -1,0 +1,20 @@
+# Long-context conversational RAG: 400-prompt variant for quick iterations.
+seed: 42
+corpus_seed: 7
+num_prompts: 400
+num_tenants: 3                    # distinct system prompts
+system_prompt_words: [150, 400]
+num_topics: 60
+docs_per_topic: 6
+doc_words: [300, 900]
+topic_zipf_s: 1.1                 # popularity skew across topics (hot prefixes)
+retrieval_k: [3, 5]
+retrieval_stability: 0.7          # P(conversation gets the topic's canonical top-k in canonical order)
+mean_turns: 3.0
+max_turns: 8
+question_words: [10, 40]
+answer_words: [40, 160]
+max_prompt_words: 9000
+output_tokens_median: 128
+output_tokens_sigma: 0.5
+output_tokens_range: [16, 512]

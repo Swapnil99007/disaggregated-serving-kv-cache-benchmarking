@@ -1,0 +1,20 @@
+# vLLM 1P+1D disaggregated serving. Compare against a colocated 2-replica run on the same 2 GPUs:
+#   kvbench analyze results/vllm/<ts> results/vllm_disagg/<ts>
+name: vllm_disagg
+deployment: vllm-disagg-1p1d
+router_url: http://localhost:8000
+model: kvbench-model
+trace:
+  path: traces/rag_1000.jsonl
+  workload: configs/workloads/rag_default.yaml
+policies: [cache_aware]
+concurrency: [8, 16, 24, 32, 48, 64]
+repeats: 3
+warmup: {engine_requests: 16, prefix_warmup_prompts: 0}
+flush_between_runs: true
+request: {ignore_eos: true, temperature: 0.0, timeout_s: 900}
+telemetry: {interval_s: 0.5, nvml: true}
+ready_timeout_s: 1800              # first start downloads weights + compiles CUDA graphs
+output_dir: results
+analysis: {baseline_policy: round_robin, slo_metric: e2e, slo_percentile: 95, slo_target_s: null, chunk_chars: 256}
+decode_policy: least_loaded

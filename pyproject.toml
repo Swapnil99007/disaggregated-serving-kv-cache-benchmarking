@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kvbench"
+version = "0.1.0"
+description = "Disaggregated LLM serving & KV-cache-aware routing testbed (vLLM, SGLang, and a GPU-free simulator)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "httpx>=0.27",
+  "pyyaml>=6.0",
+  "numpy>=1.24",
+  "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+gpu = ["nvidia-ml-py>=12.535"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+kvbench = "kvbench.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

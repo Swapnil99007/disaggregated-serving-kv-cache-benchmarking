@@ -1,0 +1,5 @@
+label,throughput_at_target,improvement_pct,improvement_pct_repeat_mean,improvement_pct_repeat_std,improvement_pct_repeat_ci95,repeats,note
+sim-4w/cache_aware,79.65191863417061,37.77436204450666,37.77436204450666,0.0,,1,lower bound: never reached target (add higher concurrency)
+sim-4w/least_loaded,68.31061577310312,18.15724806620278,18.15724806620278,0.0,,1,lower bound: never reached target (add higher concurrency)
+sim-4w/prefix_affinity,67.56766425722421,16.87216074017943,16.87216074017943,0.0,,1,ok
+sim-4w/round_robin,57.81330971319601,0.0,0.0,0.0,,1,ok

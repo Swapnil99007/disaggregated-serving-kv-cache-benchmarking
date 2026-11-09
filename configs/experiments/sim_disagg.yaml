@@ -1,0 +1,20 @@
+# Disaggregated (2 prefill + 2 decode) on the simulator. Compare against sim_full/sim_quick
+# (4 colocated workers) with:  kvbench analyze results/sim_quick/<ts> results/sim_disagg/<ts>
+#   kvbench cluster --config configs/router/sim_local_disagg.yaml
+name: sim_disagg
+deployment: sim-disagg-2p2d
+router_url: http://localhost:8000
+model: kvbench-model
+trace:
+  path: traces/rag_400.jsonl
+  workload: configs/workloads/rag_small.yaml
+policies: [round_robin, cache_aware]     # prefill-worker selection
+decode_policy: least_loaded
+concurrency: [8, 16, 32, 64]
+repeats: 1
+warmup: {engine_requests: 8, prefix_warmup_prompts: 0}
+flush_between_runs: true
+request: {ignore_eos: true, temperature: 0.0, timeout_s: 900}
+telemetry: {interval_s: 0.5, nvml: false}
+output_dir: results
+analysis: {baseline_policy: round_robin, slo_metric: e2e, slo_percentile: 95, slo_target_s: null, chunk_chars: 256}

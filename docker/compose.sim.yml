@@ -1,0 +1,41 @@
+# Simulated 4-worker colocated cluster + router. No GPU required.
+#   docker compose -f docker/compose.sim.yml up --build -d
+#   kvbench bench --experiment configs/experiments/sim_quick.yaml      # from the host
+#   # or run the benchmark inside docker:
+#   docker compose -f docker/compose.sim.yml --profile bench run --rm bench
+name: kvbench-sim
+
+x-sim-worker: &sim-worker
+  image: kvbench:latest
+  build: {context: .., dockerfile: docker/Dockerfile}
+  volumes: ["../configs:/app/configs:ro"]
+  restart: unless-stopped
+
+services:
+  worker0:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, worker0, --advertised-host, worker0, --speed, "${SIM_SPEED:-1.0}"]
+  worker1:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, worker1, --advertised-host, worker1, --speed, "${SIM_SPEED:-1.0}"]
+  worker2:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, worker2, --advertised-host, worker2, --speed, "${SIM_SPEED:-1.0}"]
+  worker3:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, worker3, --advertised-host, worker3, --speed, "${SIM_SPEED:-1.0}"]
+
+  router:
+    image: kvbench:latest
+    depends_on: [worker0, worker1, worker2, worker3]
+    volumes: ["../configs:/app/configs:ro"]
+    command: [router, --config, configs/router/sim_docker.yaml, --host, 0.0.0.0, --port, "8000"]
+    ports: ["8000:8000"]
+    restart: unless-stopped
+
+  bench:
+    profiles: [bench]
+    image: kvbench:latest
+    depends_on: [router]
+    volumes: ["../configs:/app/configs:ro", "../results:/app/results", "../traces:/app/traces"]
+    command: [bench, --experiment, "${EXPERIMENT:-configs/experiments/sim_quick.yaml}", --router-url, "http://router:8000"]

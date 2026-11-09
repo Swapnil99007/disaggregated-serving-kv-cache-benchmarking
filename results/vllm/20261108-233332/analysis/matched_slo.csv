@@ -1,0 +1,5 @@
+label,throughput_at_target,improvement_pct,improvement_pct_repeat_mean,improvement_pct_repeat_std,improvement_pct_repeat_ci95,repeats,note
+vllm-2w/cache_aware,9.488479143775077,21.07438807898483,21.202413478843454,1.638481200224886,4.070541449337546,3,lower bound: never reached target (add higher concurrency)
+vllm-2w/least_loaded,9.252105422151908,18.058224659133426,18.179353491785054,1.2997271084674387,3.228961715958778,3,lower bound: never reached target (add higher concurrency)
+vllm-2w/prefix_affinity,10.057470582049769,28.334802437010296,28.480227601164668,2.517996438946845,6.255554761696798,3,lower bound: never reached target (add higher concurrency)
+vllm-2w/round_robin,7.836900350539136,0.0,0.0,0.0,0.0,3,ok

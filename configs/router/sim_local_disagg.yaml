@@ -1,0 +1,20 @@
+# Disaggregated prefill/decode with simulated workers: 2 prefill + 2 decode.
+# Same total "GPU" count as sim_local.yaml, so the comparison is iso-hardware.
+#   kvbench cluster --config configs/router/sim_local_disagg.yaml
+model: kvbench-model
+mode: disagg
+policy: cache_aware               # picks the PREFILL worker (where prefix reuse saves compute)
+decode_policy: least_loaded       # picks the DECODE worker
+chunk_chars: 256
+chars_per_token: 5.0
+index_capacity_tokens: 131072
+scrape_interval_s: 0.5
+port: 8000
+policy_params:
+  cache_aware: {prefill_tps: 10000, decode_cost_s: 0.0, mem_high_watermark: 0.9, mem_penalty_s: 1.0, imbalance_abs: 8, imbalance_rel: 1.5}
+  prefix_affinity: {key_chunks: 16}
+workers:
+  - {name: p0, url: "http://localhost:9101", backend: sim, role: prefill, sim_config: configs/sim/default.yaml}
+  - {name: p1, url: "http://localhost:9102", backend: sim, role: prefill, sim_config: configs/sim/default.yaml}
+  - {name: d0, url: "http://localhost:9201", backend: sim, role: decode,  sim_config: configs/sim/default.yaml}
+  - {name: d1, url: "http://localhost:9202", backend: sim, role: decode,  sim_config: configs/sim/default.yaml}

@@ -1,0 +1,19 @@
+# 1,000 replayed RAG prompts x 8-64 sessions x 3 repeats against 2 vLLM replicas.
+# Rename 'deployment' if you change topology (e.g. vllm-4w) so labels stay unambiguous.
+name: vllm
+deployment: vllm-2w
+router_url: http://localhost:8000
+model: kvbench-model
+trace:
+  path: traces/rag_1000.jsonl
+  workload: configs/workloads/rag_default.yaml
+policies: [round_robin, least_loaded, prefix_affinity, cache_aware]
+concurrency: [8, 16, 24, 32, 48, 64]
+repeats: 3
+warmup: {engine_requests: 16, prefix_warmup_prompts: 0}
+flush_between_runs: true
+request: {ignore_eos: true, temperature: 0.0, timeout_s: 900}
+telemetry: {interval_s: 0.5, nvml: true}
+ready_timeout_s: 1800              # first start downloads weights + compiles CUDA graphs
+output_dir: results
+analysis: {baseline_policy: round_robin, slo_metric: e2e, slo_percentile: 95, slo_target_s: null, chunk_chars: 256}

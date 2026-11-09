@@ -1,0 +1,19 @@
+# Full methodology on the simulator: 1,000 prompts, 6 concurrency levels, 3 repeats
+# (4 policies x 6 x 3 = 72 runs; roughly 1-2 hours at speed=1, proportionally less with --set speed=N).
+#   kvbench cluster --config configs/router/sim_local.yaml
+name: sim_full
+deployment: sim-4w
+router_url: http://localhost:8000
+model: kvbench-model
+trace:
+  path: traces/rag_1000.jsonl
+  workload: configs/workloads/rag_default.yaml
+policies: [round_robin, least_loaded, prefix_affinity, cache_aware]
+concurrency: [8, 16, 24, 32, 48, 64]
+repeats: 3
+warmup: {engine_requests: 8, prefix_warmup_prompts: 0}
+flush_between_runs: true
+request: {ignore_eos: true, temperature: 0.0, timeout_s: 900}
+telemetry: {interval_s: 0.5, nvml: false}
+output_dir: results
+analysis: {baseline_policy: round_robin, slo_metric: e2e, slo_percentile: 95, slo_target_s: null, chunk_chars: 256}

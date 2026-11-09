@@ -1,0 +1,39 @@
+# Simulated disaggregated cluster: 2 prefill + 2 decode workers + router (P/D mode).
+#   docker compose -f docker/compose.sim-disagg.yml up --build -d
+#   kvbench bench --experiment configs/experiments/sim_disagg.yaml
+name: kvbench-sim-disagg
+
+x-sim-worker: &sim-worker
+  image: kvbench:latest
+  build: {context: .., dockerfile: docker/Dockerfile}
+  volumes: ["../configs:/app/configs:ro"]
+  restart: unless-stopped
+
+services:
+  prefill0:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, prefill0, --role, prefill, --advertised-host, prefill0, --speed, "${SIM_SPEED:-1.0}"]
+  prefill1:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, prefill1, --role, prefill, --advertised-host, prefill1, --speed, "${SIM_SPEED:-1.0}"]
+  decode0:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, decode0, --role, decode, --advertised-host, decode0, --speed, "${SIM_SPEED:-1.0}"]
+  decode1:
+    <<: *sim-worker
+    command: [sim-worker, --port, "9000", --config-file, configs/sim/default.yaml, --engine-id, decode1, --role, decode, --advertised-host, decode1, --speed, "${SIM_SPEED:-1.0}"]
+
+  router:
+    image: kvbench:latest
+    depends_on: [prefill0, prefill1, decode0, decode1]
+    volumes: ["../configs:/app/configs:ro"]
+    command: [router, --config, configs/router/sim_docker_disagg.yaml, --host, 0.0.0.0, --port, "8000"]
+    ports: ["8000:8000"]
+    restart: unless-stopped
+
+  bench:
+    profiles: [bench]
+    image: kvbench:latest
+    depends_on: [router]
+    volumes: ["../configs:/app/configs:ro", "../results:/app/results", "../traces:/app/traces"]
+    command: [bench, --experiment, "${EXPERIMENT:-configs/experiments/sim_disagg.yaml}", --router-url, "http://router:8000"]

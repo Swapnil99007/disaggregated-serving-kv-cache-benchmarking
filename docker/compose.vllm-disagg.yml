@@ -1,0 +1,92 @@
+# EXPERIMENTAL: vLLM prefill/decode disaggregation with NixlConnector (needs 2 GPUs).
+# Uses host networking so the decode instance can reach the prefill instance's NIXL side channel.
+# The router speaks the same protocol as vLLM's reference disagg proxy
+# (prefill with max_tokens=1 + kv_transfer_params, then decode with the returned params).
+# KV-connector flags change between vLLM releases — if this fails, compare with the
+# disaggregated-serving examples for your vLLM version, or use scripts/vllm_disagg_baremetal.sh.
+#   docker compose -f docker/compose.vllm-disagg.yml --env-file .env up --build -d
+#   kvbench bench --experiment configs/experiments/vllm_disagg.yaml
+name: kvbench-vllm-disagg
+
+x-vllm: &vllm
+  image: ${VLLM_IMAGE:-vllm/vllm-openai:v0.11.0}
+  entrypoint: ["vllm", "serve"]
+  network_mode: host
+  ipc: host
+  volumes:
+    - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+  restart: unless-stopped
+
+services:
+  vllm-prefill:
+    <<: *vllm
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_SERVER_DEV_MODE: "1"
+      VLLM_NIXL_SIDE_CHANNEL_HOST: "127.0.0.1"
+      VLLM_NIXL_SIDE_CHANNEL_PORT: "5600"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8100/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 60s
+    command:
+      - ${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
+      - --port
+      - "8100"
+      - --served-model-name
+      - kvbench-model
+      - --gpu-memory-utilization
+      - "${DISAGG_GPU_MEM_UTIL:-0.85}"
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-16384}"
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+      - --kv-transfer-config
+      - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${PREFILL_GPU:-0}"], capabilities: [gpu]}]
+
+  vllm-decode:
+    <<: *vllm
+    depends_on: {vllm-prefill: {condition: service_healthy}}
+    environment:
+      HF_TOKEN: ${HF_TOKEN:-}
+      VLLM_SERVER_DEV_MODE: "1"
+      VLLM_NIXL_SIDE_CHANNEL_HOST: "127.0.0.1"
+      VLLM_NIXL_SIDE_CHANNEL_PORT: "5601"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8200/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 90
+      start_period: 60s
+    command:
+      - ${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
+      - --port
+      - "8200"
+      - --served-model-name
+      - kvbench-model
+      - --gpu-memory-utilization
+      - "${DISAGG_GPU_MEM_UTIL:-0.85}"
+      - --max-model-len
+      - "${MAX_MODEL_LEN:-16384}"
+      - --enable-prefix-caching
+      - --enable-prompt-tokens-details
+      - --kv-transfer-config
+      - '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, device_ids: ["${DECODE_GPU:-1}"], capabilities: [gpu]}]
+
+  router:
+    image: kvbench:latest
+    build: {context: .., dockerfile: docker/Dockerfile}
+    network_mode: host
+    volumes: ["../configs:/app/configs:ro"]
+    command: [router, --config, configs/router/vllm_disagg.yaml, --host, 0.0.0.0, --port, "8000"]
+    restart: unless-stopped

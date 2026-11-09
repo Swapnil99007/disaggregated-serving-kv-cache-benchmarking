@@ -1,0 +1,24 @@
+# 2 SGLang workers behind the router (docker compose service names).
+model: kvbench-model
+mode: colocated
+policy: cache_aware
+chunk_chars: 256
+chars_per_token: 4.0              # BPE tokenizers average ~4 chars/token on English text
+index_capacity_tokens: 131072     # match --num-gpu-blocks-override x 16 (vLLM) / --max-total-tokens (SGLang)
+index_ttl_s: 600
+scrape_interval_s: 0.5
+request_timeout_s: 900
+port: 8000
+policy_params:
+  cache_aware:
+    prefill_tps: 20000            # rough per-replica prefill throughput; only relative costs matter
+    decode_cost_s: 0.005
+    mem_high_watermark: 0.9
+    mem_penalty_s: 1.0
+    imbalance_abs: 8
+    imbalance_rel: 1.5
+  prefix_affinity: {key_chunks: 16}
+  weighted: {w_hit: 0.5, w_queue: 0.3, w_mem: 0.2}
+workers:
+  - {name: sglang0, url: "http://sglang0:8000", backend: sglang, role: both}
+  - {name: sglang1, url: "http://sglang1:8000", backend: sglang, role: both}

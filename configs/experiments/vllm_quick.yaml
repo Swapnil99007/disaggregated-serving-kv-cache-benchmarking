@@ -1,0 +1,18 @@
+# Fast sanity pass on real vLLM (~15-30 min on one GPU): 400 prompts, 4 levels, 1 repeat.
+name: vllm_quick
+deployment: vllm-2w
+router_url: http://localhost:8000
+model: kvbench-model
+trace:
+  path: traces/rag_400.jsonl
+  workload: configs/workloads/rag_small.yaml
+policies: [round_robin, least_loaded, prefix_affinity, cache_aware]
+concurrency: [8, 16, 32, 64]
+repeats: 1
+warmup: {engine_requests: 16, prefix_warmup_prompts: 0}
+flush_between_runs: true
+request: {ignore_eos: true, temperature: 0.0, timeout_s: 900}
+telemetry: {interval_s: 0.5, nvml: true}
+ready_timeout_s: 1800
+output_dir: results
+analysis: {baseline_policy: round_robin, slo_metric: e2e, slo_percentile: 95, slo_target_s: null, chunk_chars: 256}

@@ -1,0 +1,15 @@
+{
+  "num_prompts": 400,
+  "num_conversations": 148,
+  "mean_turns": 2.7027027027027026,
+  "prompt_chars_total": 7231707.0,
+  "prompt_chars_mean": 18079.2675,
+  "prompt_chars_p50": 18042.5,
+  "prompt_chars_p95": 25384.949999999997,
+  "prompt_chars_max": 29012.0,
+  "max_tokens_mean": 145.295,
+  "max_tokens_total": 58118.0,
+  "chunk_chars": 256,
+  "unique_prefix_chars": 1564123.0,
+  "max_reuse_fraction": 0.7837131675827022
+}

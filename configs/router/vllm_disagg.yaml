@@ -1,0 +1,16 @@
+# vLLM P/D disaggregation (NixlConnector): 1 prefill + 1 decode instance on the host network.
+model: kvbench-model
+mode: disagg
+policy: cache_aware               # prefill-worker choice (trivial with one prefill worker; add more to compare)
+decode_policy: least_loaded
+chunk_chars: 256
+chars_per_token: 4.0
+index_capacity_tokens: 131072
+scrape_interval_s: 0.5
+request_timeout_s: 900
+port: 8000
+policy_params:
+  cache_aware: {prefill_tps: 20000, decode_cost_s: 0.0, mem_high_watermark: 0.9, mem_penalty_s: 1.0, imbalance_abs: 8, imbalance_rel: 1.5}
+workers:
+  - {name: prefill0, url: "http://127.0.0.1:8100", backend: vllm, role: prefill}
+  - {name: decode0,  url: "http://127.0.0.1:8200", backend: vllm, role: decode}
