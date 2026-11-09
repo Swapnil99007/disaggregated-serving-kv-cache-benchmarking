@@ -9,7 +9,7 @@ and you can stop wherever the detail stops being useful to you.
 |---|---|---|
 | [1. The short version](#level-1-the-short-version) | Anyone | The problem, the idea, and what the experiments found. No jargon |
 | [2. The concepts](#level-2-the-concepts) | Anyone curious about how AI chat services run | Prefill and decode, the KV cache, prefix caching, why routing matters |
-| [3. How it is built](#level-3-how-it-is-built) | Software engineers | Architecture, the life of a request, the workload, the router, the simulator, the benchmark harness |
+| [3. How it is built](#level-3-how-it-is-built) | Anyone comfortable with Level 2 | The router step by step, following one example request; the test workload, simulator and benchmark |
 | [4. Measurement and results](#level-4-measurement-and-results) | ML-systems engineers | Methodology, metric definitions, real-GPU results, simulator studies, limitations |
 
 There is a [glossary](#glossary) at the end.
@@ -231,295 +231,408 @@ studies it in the simulator.
 
 ## Level 3: How it is built
 
-### 3.1 Architecture
+This level opens up the **router**, the part that makes the decisions, by following one
+request from the moment it arrives to the moment its answer finishes. Each step starts with the
+idea in plain words and a small example, then names the technical term and the code file. The
+fine print sits in folded **More detail** sections; skip them on a first read.
+
+### 3.1 The pieces, and who talks to whom
 
 ```mermaid
 flowchart LR
-    GEN["Trace generator<br/>workload/"] --> TR[("Trace<br/>1,000 prompts")]
-    TR --> CL["Benchmark client<br/>N closed-loop sessions<br/>bench/"]
-    CL -->|"HTTP, streaming"| H
-    subgraph RT["Router: router/"]
-        direction TB
-        H["Hash the prompt prefix"] --> P["Policy picks a worker"]
-        I[("Prefix index<br/>per worker")] --> P
-        M["Telemetry loop"] --> P
+    T["Test conversations<br/>(1,000 prompts)"] --> C["Benchmark client<br/>pretends to be<br/>8 to 64 users"]
+    C --> R["Router<br/>decides which server<br/>gets each request"]
+    R --> S["Model servers<br/>vLLM, SGLang<br/>or the simulator"]
+    S -->|"answer streams back"| R
+    R -->|"answer streams back"| C
+    C --> L["Logs: timings,<br/>cache hits"]
+    L --> A["Analysis<br/>tables + charts"]
+```
+
+| Piece | Its job, in one sentence | Code |
+|---|---|---|
+| Test conversations | A fixed, repeatable set of realistic document-question conversations | `src/kvbench/workload/` |
+| Benchmark client | Plays the users: sends each conversation's questions in order and times every answer | `src/kvbench/bench/` |
+| **Router** | Sits between users and servers and picks a server for every request | `src/kvbench/router/` |
+| Model servers | Run the language model. Real ones are vLLM or SGLang on a GPU; the simulator is a stand-in for laptops | `src/kvbench/sim/` |
+| Analysis | Turns the logs into the report, tables and charts | `src/kvbench/analysis/` |
+
+Everything talks over ordinary HTTP, in the same format OpenAI's API uses. That's why the same
+router and client work unchanged against the simulator on a laptop and against vLLM on a GPU.
+
+### 3.2 Following one request through the router
+
+**The example.** There are two model servers, **A** and **B**. A few seconds ago, server A
+answered the first turn of a conversation about billing. Now the user asks a follow-up question.
+The new prompt is about 18,000 characters: the app's instructions, three billing documents, the
+first question and answer, and the new question.
+
+The router handles it in five steps:
+
+```mermaid
+flowchart LR
+    S1["1. Fingerprint<br/>the prompt"] --> S2["2. Check each server's<br/>notebook: how much of this<br/>prompt has it seen?"]
+    S2 --> S3["3. Estimate the wait<br/>at each server,<br/>pick the shortest"]
+    S3 --> S4["4. Send the request,<br/>update the notebook<br/>and busy counters"]
+    S4 --> S5["5. Learn from<br/>the reply"]
+```
+
+#### Step 1: Fingerprint the prompt
+
+**The idea.** The router needs a quick way to ask "has a server already seen the beginning of
+this prompt?" Comparing 18,000 characters against everything it ever sent would be slow. So it:
+
+1. cuts the prompt into **pieces of 256 characters** (the example prompt makes 70 pieces);
+2. gives each piece a short **ID number**, computed from the piece's text.
+
+**The trick.** Each piece's ID is computed from its own text *and the previous piece's ID*. So
+the ID of piece 5 doesn't just stand for piece 5. It stands for "exactly these first five pieces,
+in this order". Two prompts that begin the same way get the same IDs up to the first
+difference, and different IDs from then on, even where their later text is identical.
+
+```mermaid
+flowchart TB
+    subgraph X["Prompt X"]
+        direction LR
+        X1["piece 1<br/>ID 7f3a"] --> X2["piece 2<br/>ID 91c2"] --> X3["piece 3<br/>ID 0b77"] --> X4["piece 4<br/>ID 5d10"]
     end
-    P --> W[("Workers<br/>vLLM, SGLang<br/>or simulator")]
-    W -.->|"/metrics every 0.5 s"| M
-    CL --> LOGS[("Per-run logs<br/>requests + telemetry")]
-    LOGS --> AN["Analysis<br/>analysis/"] --> REP["REPORT.md<br/>tables + charts"]
+    subgraph Y["Prompt Y: same start, piece 3 differs"]
+        direction LR
+        Y1["piece 1<br/>ID 7f3a"] --> Y2["piece 2<br/>ID 91c2"] --> Y3["piece 3 (different text)<br/>ID e4f8"] --> Y4["piece 4 (same text as X)<br/>ID c2a9"]
+    end
+    X ~~~ Y
 ```
 
-| Component | Role | Code |
+*(The IDs are made up for illustration.)* Pieces 1–2 match. From piece 3 on, every ID differs,
+including piece 4, whose text is identical to X's. That matches how a real KV cache behaves:
+reuse stops at the first difference ([2.4](#24-prefix-caching-reusing-what-was-already-read)).
+
+**Technical name:** chained hashing (BLAKE2b, 8-byte IDs). **Code:** `chunk_hashes()` in
+`src/kvbench/common/prefix.py`.
+
+<details>
+<summary>More detail</summary>
+
+- Formally: `h0 = H(model name + piece 0)`, then `h_i = H(h_(i−1) + piece i)`. Including the
+  model name keeps two models' prefixes from ever matching each other.
+- vLLM identifies its 16-token KV blocks the same way, by chaining each block's hash with its
+  parent's. The router works on characters rather than tokens, so it doesn't need the model's
+  tokenizer. SGLang's router makes the same trade-off.
+- A final piece shorter than 256 characters gets no ID: like a partly filled KV block, it can't
+  be shared.
+
+</details>
+
+#### Step 2: Check each server's notebook
+
+**The idea.** The router can't look inside a server's memory. Instead it keeps a **notebook for
+each server**, listing the IDs of every piece it has sent there. To guess how much of the new
+prompt a server already has, it reads the prompt's IDs from the start and counts how many are in
+that server's notebook, **stopping at the first one that's missing**.
+
+In the example:
+
+| | IDs found in the notebook (from the start) | Router's guess |
 |---|---|---|
-| Workload generator | Builds a deterministic multi-turn RAG trace with realistic prefix sharing | `src/kvbench/workload/` |
-| Router | OpenAI-compatible proxy. Hashes prompts, tracks what each worker has cached, applies a routing policy, streams responses back | `src/kvbench/router/` |
-| Simulator | A GPU-free engine with paged KV blocks, prefix caching and a cost model. Speaks vLLM's API and metric names | `src/kvbench/sim/` |
-| Benchmark harness | Runs policy × concurrency × repeat sweeps with cache flushes, warm-up and telemetry | `src/kvbench/bench/` |
-| Analysis | Statistics, prefill accounting, matched-latency throughput, charts, report | `src/kvbench/analysis/` |
-| Deployment | Docker Compose files and bare-metal scripts for vLLM, SGLang, the simulator, and disaggregated vLLM | `docker/`, `scripts/` |
+| Server A | 67 of 70: it saw everything up to the new turn | 96% of this prompt is cached on A |
+| Server B | 8 of 70: it has seen this app's instructions, but not these documents | 11% cached on B |
 
-Every component talks plain HTTP. The same router and benchmark therefore run unchanged against
-the simulator on a laptop and against vLLM or SGLang on a GPU.
+A notebook can only hold as much as the server's memory, which here is 2,048 pieces. When it's
+full, the entries **used longest ago are forgotten first**, which is roughly what the server does
+with its own memory.
 
-### 3.2 The life of one request
+**Technical name:** the per-worker prefix index. **Code:** `PrefixIndex` in
+`src/kvbench/router/index.py`.
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant C as Benchmark client
-    participant R as Router
-    participant W as Chosen worker (vLLM)
-    C->>R: POST /v1/completions (stream, max_tokens, ignore_eos)
-    R->>R: Extract prompt text, compute chained 256-char chunk hashes
-    R->>R: Policy scores workers (prefix match, pending prefill, in-flight, KV usage)
-    R->>R: Open a lease: in-flight +1, pending prefill += estimated uncached tokens
-    R->>W: Forward the request
-    W-->>R: Accepted (response headers)
-    R->>R: Record the prompt's chunks in this worker's prefix index
-    W-->>R: First token
-    R->>R: Prefill done: release the pending-prefill estimate
-    R-->>C: Stream tokens (headers name the worker, routing reason, predicted match)
-    W-->>R: Final chunk with usage (prompt_tokens, cached_tokens)
-    R->>R: Compare predicted vs actual cached fraction, close lease (in-flight -1)
-    R-->>C: Final chunk
-```
+<details>
+<summary>More detail</summary>
 
-Two details matter here:
+- **Capacity:** 131,072 tokens of KV memory × 4 characters per token ÷ 256 characters per piece =
+  2,048 pieces per server. Eviction is least-recently-used (LRU).
+- **Insertion order:** a prompt's IDs are written last-to-first. That makes the shared beginning
+  the most recently used part, so it is forgotten last, as in the real engines.
+- **Expiry:** entries untouched for 600 s are treated as gone.
+- **Reset:** a notebook is wiped when its server's cache is flushed, when the server restarts
+  (its statistics counters jump backwards), or when it stops answering health checks.
+- **It's only a guess.** The server may already have evicted something the notebook still
+  lists. Step 5 measures how good the guesses are.
 
-- **The index is updated when the worker accepts the request, not when it finishes.** If ten
-  requests with the same new prefix arrive within a second, the first one is still prefilling
-  when the others are routed. Updating early sends them to the same worker, where they can share
-  the work instead of computing it ten times on different workers.
-- **The router's load numbers are exact**, because every request passes through it. Engine
-  metrics (queue depth, KV usage) arrive every 0.5 s and are always slightly stale. The router's
-  own counters (in-flight requests, requests still in prefill, estimated pending prefill tokens)
-  are current.
+</details>
 
-### 3.3 The workload: a synthetic long-context RAG service
+#### Step 3: Estimate the wait at each server and pick the shortest
 
-`workload/rag.py` generates the trace from a seed, so every run replays the same 1,000 prompts:
+**The idea.** For each server the router now knows two things:
 
-| Ingredient | Setting | Why |
-|---|---|---|
-| Tenants (applications) | 3, each with a 150–400-word system prompt | Cross-user sharing of the first part of the prompt |
-| Corpus | 60 topics × 6 documents of 300–900 words | Long retrieved context |
-| Topic popularity | Zipf, s = 1.1 | A few hot topics create heavy reuse, plus a long tail |
-| Retrieval | 3–5 documents. 70% of conversations get the topic's canonical top-k in canonical order; 30% get a shuffled subset plus an off-topic document | Partial and full prefix overlap, like real retrievers |
-| Conversations | Geometric number of turns, mean 3, max 8. Each turn appends the previous Q&A | Within-session reuse |
-| Output length | Log-normal, median 128 tokens (16–512), replayed exactly using `ignore_eos` | Identical decode work for every policy |
+- how much of this prompt it probably has cached (step 2);
+- how busy it is. This number is exact, because every request passes through the router, so it
+  counts what each server is still working on.
 
-Resulting trace: **1,000 prompts in 369 conversations, mean 18,047 characters (about 3,360 tokens),
-p95 24,909 characters**, with a maximum achievable prefix reuse of **81.3%**.
-
-The document text is random words from a fixed vocabulary. The *structure* of reuse is realistic;
-the *content* is not ([limitations](#47-limitations-and-threats-to-validity)).
-
-### 3.4 The router
-
-#### Prefix fingerprints: chained chunk hashes
-
-The router never sees a worker's real KV cache. It identifies prefixes by hashing fixed 256-byte
-chunks of the prompt, with each hash folding in the previous one:
-
-```mermaid
-flowchart LR
-    NS["namespace<br/>(model name)"] --> H0
-    C0["chunk 0<br/>bytes 0-255"] --> H0["h0 = H(ns, chunk 0)"]
-    H0 --> H1["h1 = H(h0, chunk 1)"]
-    C1["chunk 1<br/>bytes 256-511"] --> H1
-    H1 --> H2["h2 = H(h1, chunk 2)"]
-    C2["chunk 2"] --> H2
-    H2 --> HD["... h_k identifies<br/>the entire prefix<br/>up to chunk k"]
-```
-
-- Because of the chaining, **two prompts share their first *k* hashes exactly when they share their
-  first *k* × 256 bytes.** This mirrors vLLM's block hashing but works on raw text, so the router
-  doesn't need the model's tokenizer. SGLang's own router makes the same trade-off with a
-  character-level radix tree.
-- The hash is BLAKE2b with an 8-byte digest. The final partial chunk isn't hashed, because like a
-  partial KV block it can't be shared.
-
-#### The per-worker prefix index
-
-`router/index.py` keeps, for each worker, the set of chunk hashes the router has *sent* there.
-It assumes they are still cached. To keep that assumption honest:
-
-- **Capacity bound with LRU eviction.** The index holds at most as many chunks as the worker's KV
-  pool could hold (131,072 tokens × 4 chars/token ÷ 256 = 2,048 chunks), and evicts the least
-  recently used, like the engine does.
-- **Tail-first insertion.** A prompt's chunks are inserted last-to-first, so the shared head of the
-  prefix is the most recently touched and is evicted last. Engines behave the same way.
-- **TTL.** Entries untouched for 600 s are treated as gone.
-- **Invalidation.** The index is cleared when the worker's cache is flushed, when it restarts
-  (detected by its Prometheus counters going backwards), or when it is marked unhealthy.
-- **Feedback.** Every response reports how many tokens the engine actually found cached. The
-  router logs predicted vs actual cache fractions per worker, and can optionally shrink the index
-  capacity when it keeps over-predicting.
-
-`match(hashes)` returns how many *leading* chunks of the new prompt are in the index. That count is
-the router's estimate of the cache hit.
-
-#### The routing policies
-
-| Policy | Rule | Strength | Weakness |
-|---|---|---|---|
-| `round_robin` | Next worker in rotation | Perfectly even request counts | Ignores the cache and actual work |
-| `least_loaded` | Fewest in-flight requests (ties broken by pending prefill) | Reacts to load | Ignores the cache |
-| `prefix_affinity` | Rendezvous hashing on the hash of the first 16 chunks (4 KB, roughly tenant + first document) | Same prefix always lands on the same worker, so the hit rate is near the maximum | Ignores load, so hot prefixes create hotspots |
-| `weighted` | 0.5 × hit fraction − 0.3 × queue pressure − 0.2 × KV usage | Easy to explain | The terms have no common unit, so the weights are arbitrary |
-| `cache_aware` | Minimizes an estimate of time-to-first-token (below) | Trades hit rate against load in one unit (seconds) | Needs rough calibration constants |
-
-#### `cache_aware` in detail
-
-For each worker *w*, with *P* the estimated prompt length in tokens and *m_w* the fraction of
-its prefix already in *w*'s index:
+The `cache_aware` policy combines both into one number, **"roughly how many seconds until this
+request's first token if I send it there?"**, and picks the server with the smallest estimate:
 
 ```
-cost(w) =  (pending_prefill_tokens(w) + P × (1 − m_w)) / prefill_tps     ← queued + new prefill work, in seconds
-         +  decode_cost_s × decode_inflight(w)                              ← slowdown from sharing a decode batch
-         +  mem_penalty_s × max(0, kv_usage(w) − 0.9) / 0.1                 ← avoid workers about to evict
+estimated wait =  (reading already queued on that server + the part of this prompt it must read)
+                     ÷ reading speed (20,000 tokens/s)
+                + 5 ms for every answer that server is currently writing
+                + a large penalty if its memory is more than 90% full
 ```
 
-The parameters are `prefill_tps` = 20,000 tokens/s, `decode_cost_s` = 5 ms,
-`mem_penalty_s` = 1 s, and a high-watermark of 90% KV usage.
+**In the example**, the router estimates the prompt at 4,500 tokens (it uses
+characters ÷ 4):
 
-```mermaid
-flowchart TD
-    A["New request: hashes + estimated prompt tokens P"] --> G{"Load guard:<br/>max in-flight − min in-flight > 8<br/>AND max > 1.5 × min ?"}
-    G -->|yes| LL["Route to the least-loaded worker<br/>(reason: load_guard)"]
-    G -->|no| L["For each healthy worker w"]
-    L --> M["m_w = matched leading chunks / total chunks"]
-    M --> C["cost(w) = prefill queue + uncached prefill<br/>+ decode-batch term + memory penalty"]
-    C --> P["Pick the minimum cost<br/>ties: fewer in-flight, then the emptier index"]
-    P --> OUT["Dispatch, open a lease, record chunks in w's index"]
-    LL --> OUT
-```
-
-**Worked example.** A prompt estimated at *P* = 4,500 tokens arrives. Two workers:
-
-| | matched | pending prefill | decoding | cost |
+| | Must read | Reading already queued | Answers being written | Estimated wait |
 |---|---:|---:|---:|---|
-| Worker A | 80% | 2,000 tokens | 30 | (2,000 + 900) / 20,000 + 30 × 0.005 = **0.295 s** |
-| Worker B | 0% | 0 tokens | 24 | (0 + 4,500) / 20,000 + 24 × 0.005 = **0.345 s** |
+| Server A | 4% of 4,500 ≈ **190** tokens | 2,000 tokens | 30 | (2,000 + 190) / 20,000 + 30 × 0.005 = **0.26 s** |
+| Server B | 89% of 4,500 ≈ **3,990** tokens | 0 tokens | 24 | (0 + 3,990) / 20,000 + 24 × 0.005 = **0.32 s** |
 
-A wins even though it is busier, because the cache hit saves more time than the extra queue costs.
-If A had 4,000 tokens of pending prefill instead, its cost would be 0.395 s and B would win. The
-cost function makes that trade explicitly, in seconds.
+**A wins**, even though it's busier, because reading 190 tokens instead of 3,990 saves more time
+than A's extra queue costs.
 
-The tie-break matters at the start of a run. When all workers are idle with empty indexes, every
-cost is equal. Breaking ties toward the emptier index spreads *new* prefixes across workers
-instead of piling them onto worker 0.
+Now suppose A had been swamped, with 6,000 tokens of reading already queued. Its estimate would
+be (6,000 + 190) / 20,000 + 0.15 = 0.46 s, and **B would win**. That trade-off between "has the
+data" and "is free" is the whole point of the policy.
 
-#### Disaggregated prefill/decode mode
+**Safety net.** If one server has more than 8 extra requests in progress *and* 1.5× as many as
+the least busy one, the router skips the formula and sends the request to the least busy server.
+
+**The other policies** compared in the experiments are simpler:
+
+| Policy | How it chooses, in plain words |
+|---|---|
+| `round_robin` | Take turns: A, B, A, B, ... |
+| `least_loaded` | Whichever server has the fewest requests in progress |
+| `prefix_affinity` | Look only at the first 16 pieces (about 4,000 characters: the app's instructions and the start of the first document) and always send that beginning to the same server |
+| `cache_aware` | The estimated-wait formula above |
+
+**Code:** `src/kvbench/router/policies.py`.
+
+<details>
+<summary>More detail</summary>
+
+- The formula exactly:
+  `cost(w) = (pending_prefill_tokens + P × (1 − m)) / prefill_tps + decode_cost_s × decode_inflight + mem_penalty_s × max(0, kv_usage − 0.9) / 0.1`,
+  with `prefill_tps` = 20,000, `decode_cost_s` = 0.005 and `mem_penalty_s` = 1.0
+  (`configs/router/vllm.yaml`).
+- **Ties** (for example, at the start when every server is idle and every notebook is empty) go to
+  the server with fewer requests in progress, then to the one with the emptier notebook. That
+  spreads *new* prefixes across servers instead of piling them all onto server A.
+- **Memory use** comes from each server's own statistics, which the router fetches every 0.5 s
+  (`/metrics`). The busy counts come from the router's own bookkeeping, which is always current.
+- `prefix_affinity` uses **rendezvous hashing**. Each server computes a score from (prefix ID,
+  server name) and the highest score wins. The same prefix therefore always lands on the same
+  server, and only about 1/N of prefixes move if a server is added.
+- A fifth policy, `weighted`, adds 0.5 × cache-hit fraction − 0.3 × queue − 0.2 × memory. It's
+  easy to explain, but the three terms have no common unit, so the weights are arbitrary. That's
+  why `cache_aware` measures everything in seconds instead.
+
+</details>
+
+#### Step 4: Send the request and update the notebook right away
+
+The router forwards the request to server A. At the same moment it:
+
+- **writes the prompt's 70 IDs into A's notebook**, without waiting for the answer to finish. If
+  ten requests with the same new documents arrive within one second, they should all follow the
+  first one to A, instead of each making a different server read the same documents;
+- **adds the request to A's busy counters**: one more request in progress, and about 190 more
+  tokens of reading queued.
+
+The answer then streams from A, through the router, back to the user. The router adds a few
+labels to the reply (which server, and why), so the benchmark can record every decision.
+
+#### Step 5: Learn from the reply
+
+- **First word arrives:** A has finished reading the prompt, so the router removes those 190
+  tokens from A's "reading queued" counter.
+- **Last word arrives:** the server's final message reports how many prompt tokens it *actually*
+  found in memory. The router compares that with its 96% guess and keeps a running score of how
+  accurate each notebook is. Then it lowers A's "in progress" count.
+
+The whole journey, as a timeline:
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant C as Client
+    participant U as User (benchmark client)
     participant R as Router
-    participant P as Prefill worker
-    participant D as Decode worker
-    C->>R: POST /v1/completions (stream)
-    R->>R: Prefill policy (e.g. cache_aware) picks P, decode policy (least_loaded) picks D later
-    R->>P: Same prompt, max_tokens=1, stream=false,<br/>kv_transfer_params {do_remote_decode: true}
-    P->>P: Prefill (reusing P's prefix cache), keep KV blocks
-    P-->>R: 1 token + kv_transfer_params {engine id, block ids, host, port}
-    R->>D: Original request + those kv_transfer_params
-    D->>P: Pull the prompt's KV blocks (NIXL)
-    D-->>R: Stream generated tokens
-    R-->>C: Stream (headers name both workers and the prefill-side cached tokens)
+    participant A as Server A
+    U->>R: follow-up question (18,000-character prompt)
+    R->>R: 1. cut into 70 pieces, compute their IDs
+    R->>R: 2. notebooks: A has 67 of 70, B has 8 of 70
+    R->>R: 3. estimated wait: A 0.26 s, B 0.32 s, so pick A
+    R->>A: 4. forward the request
+    R->>R: 4. write the 70 IDs into A's notebook, mark A busier
+    A-->>R: first word (prompt reading finished)
+    R->>R: 5. lower A's reading queue
+    R-->>U: answer streams back word by word
+    A-->>R: last word + report: 3,200 prompt tokens were cached
+    R->>R: 5. compare with the guess, lower A's in-progress count
+    R-->>U: done
 ```
 
-Prefix caching happens on the **prefill** pool, so the cache-aware policy routes the prefill step.
-The decode step only needs free capacity, so it goes to the least-loaded decode worker.
+<details>
+<summary>More detail: the code names for these steps</summary>
 
-### 3.5 The simulator
+- Steps 3–5 are handled by a `Lease` object in `src/kvbench/router/app.py`.
+- `Lease.accepted()` writes the notebook (the index). `first_token()` releases the queued
+  prefill estimate. `feedback()` compares predicted vs reported cached tokens. `release()`
+  decrements in-flight.
+- Busy counters: `inflight`, `prefill_inflight` (requests still reading) and
+  `pending_prefill_tokens`. Requests still writing = `inflight − prefill_inflight`.
+- Reply labels: `x-kvbench-worker`, `x-kvbench-reason`, `x-kvbench-matched-chunks`,
+  `x-kvbench-prompt-chunks`.
+- vLLM leaves out the cached-token field entirely when nothing was cached. The router treats
+  that as 0 once a server has reported the field at least once.
+- Optional: with `adaptive_capacity` on, a server whose notebook keeps over-promising gets its
+  notebook capacity shrunk.
 
-A GPU costs money by the hour, so the router and the benchmark were developed against
-`kvbench sim-worker`. It is a small continuous-batching engine that behaves like vLLM from the
-outside.
+</details>
 
-```mermaid
-flowchart LR
-    A["ADMIT<br/>FCFS while sequence slots and KV blocks are free.<br/>Probe the prefix cache, so hit blocks are not recomputed"] --> S["SCHEDULE<br/>token budget 2,048 per step:<br/>every decoding sequence gets 1 token,<br/>prefills get chunks of the rest"]
-    S --> CO["COST<br/>step time = 2 ms + prefill tokens / 10k tok/s<br/>+ 8 ms weights read + 30 ns × context tokens<br/>+ 0.05 ms per sequence"]
-    CO --> AP["APPLY<br/>advance prefill progress,<br/>emit one token per decoding sequence"]
-    AP --> A
-```
+### 3.3 The test conversations
 
-- **Paged KV blocks** of 16 tokens, a pool of 8,192 blocks, and hash-chained prefix caching with LRU
-  eviction of unused cached blocks.
-- **Prefill–decode interference falls out of the model.** Prefill chunks and decodes share a step,
-  so a big prefill makes the step longer for every decoding sequence in it.
-- **Disaggregation.** It implements the same `kv_transfer_params` protocol as vLLM, with a modeled
-  KV transfer link (25 GB/s, 2 ms latency, serialized per engine).
-- **Same interface as vLLM.** It exposes vLLM's endpoints and Prometheus metric names, plus
-  `sim:*` metrics such as exact prefill tokens computed.
-- **Relative costs only.** It is calibrated to be roughly right about *relative* costs (prefill vs
-  decode, hit vs miss, transfer vs recompute), not to predict absolute numbers on real hardware.
-- **Speed factor.** A `speed` setting compresses simulated time to make runs faster.
+**The idea.** To compare routing rules fairly, every run must replay *exactly the same*
+conversations. The project generates them from a fixed random seed, imitating an imaginary
+company's document-chat service:
 
-### 3.6 The benchmark harness
+- **3 apps**, each with its own instructions (150–400 words). Everyone using an app shares this
+  opening.
+- **60 topics × 6 documents** (300–900 words each). A few topics are very popular and most are
+  rare. This popularity pattern is called a Zipf distribution; real traffic has it too.
+- Each conversation picks an app and a topic, and "retrieves" **3–5 documents**. 70% of the time
+  that's the topic's standard top documents in the standard order, so they share a prefix with
+  other conversations on that topic. 30% of the time it's a shuffled mix, so they share less.
+- Conversations last **about 3 turns** (at most 8). Each turn's prompt repeats everything before it
+  and adds the new question.
+- Answer lengths are fixed per request (median 128 tokens), so every routing rule does exactly the
+  same writing work.
 
-**Closed-loop sessions.** At concurrency *N*, there are *N* simulated users. Each takes the next
-whole conversation from a shared queue and plays its turns in order, sending turn *t+1* only after
-turn *t* has finished, like a real user. A session's next conversation starts as soon as its
-previous one ends.
+The result is **1,000 prompts in 369 conversations**, averaging 18,047 characters (about 3,360
+tokens). At most **81.3%** of all prompt text could be served from a cache.
 
-**One run** (one policy at one concurrency level for one repeat):
+The document text itself is random words. The *pattern* of sharing is realistic; the content
+isn't ([limitations](#47-limitations-and-threats-to-validity)).
+
+**Code:** `src/kvbench/workload/rag.py`. The prompt layout and the reuse figure are in
+[2.4](#24-prefix-caching-reusing-what-was-already-read)–[2.5](#25-why-long-context-rag-has-so-much-reuse).
+
+### 3.4 The practice server (simulator)
+
+**The idea.** Renting a GPU costs money by the hour. So the router and the benchmark were built
+and tested against a **pretend model server** that runs on a laptop. It looks exactly like vLLM
+from the outside, with the same web addresses and statistics names. Inside, it doesn't run a
+model; it follows the same *rules* a real server does:
+
+- **Memory:** a fixed amount of KV memory in 16-token blocks, with prefix caching. Cached blocks
+  are reused, and the oldest unused ones are thrown out when space runs out.
+- **Work in rounds:** in each round it lets in new requests if memory allows, and gives every
+  request that's writing one more word. Leftover capacity in the round goes to reading prompts.
+- **Pretend time:** it works out how long that round would take on a real GPU using a simple
+  formula, waits that long, and moves on.
+
+Because reading and writing share rounds, a big reading job slows down everyone's writing. That's
+the same interference real servers have ([2.2](#22-how-a-model-answers-prefill-then-decode)).
+
+The simulator gets the *relative* costs roughly right (reading vs writing, cache hit vs miss),
+not the exact numbers a real GPU would produce.
+
+**Code:** `src/kvbench/sim/`.
+
+<details>
+<summary>More detail</summary>
+
+- **Scheduler loop:** admit (first-come first-served, while sequence slots and KV blocks are
+  free) → schedule (a token budget of 2,048 per step: every decoding sequence gets 1 token, and
+  prefill chunks get the rest) → cost → apply.
+- **Step time** = 2 ms + prefill tokens / 10,000 tokens/s + 8 ms (weights read, if anything is
+  decoding) + 30 ns × total context tokens + 0.05 ms per decoding sequence.
+- **Disaggregated mode:** it uses the same `kv_transfer_params` protocol as vLLM, with a
+  simulated KV transfer link (25 GB/s, 2 ms latency).
+- **Speed setting:** `speed` makes simulated time run faster for quick experiments. Ratios
+  between policies are preserved.
+
+</details>
+
+### 3.5 How a benchmark run works
+
+**The idea.** The benchmark client pretends to be *N* users (8, 16, 24, 32, 48 or 64). Each
+pretend user:
+
+1. takes the next conversation from a shared pile;
+2. sends its turns one at a time, waiting for each answer before asking the next question, like
+   a real person;
+3. moves on to the next conversation when that one is finished.
+
+This is called a **closed loop**. A **run** is one routing rule at one number of users. Before
+every run, everything is reset so each rule starts from the same blank state:
 
 ```mermaid
 flowchart TD
-    A["Switch router policy<br/>POST /admin/policy"] --> B["Flush every engine's prefix cache<br/>and clear the router index"]
-    B --> C["Engine warm-up: short unrelated prompts<br/>(CUDA graphs, allocator, connections)"]
-    C --> D["Flush again, so warm-up never pollutes the cache"]
-    D --> E["Snapshot engine Prometheus counters,<br/>start GPU + router telemetry samplers (0.5 s)"]
-    E --> F["Replay the 1,000-prompt trace<br/>with N closed-loop sessions, streaming"]
-    F --> G["Stop samplers, snapshot counters again"]
-    G --> H["Write run.json, requests.jsonl,<br/>telemetry_gpu.jsonl, telemetry_router.jsonl"]
+    A["Switch the router to the rule being tested"] --> B["Wipe every server's memory<br/>and the router's notebooks"]
+    B --> C["Warm up the servers with<br/>a few unrelated requests"]
+    C --> D["Wipe memory again,<br/>so the warm-up doesn't help"]
+    D --> E["Start recording GPU and router statistics"]
+    E --> F["Replay all 1,000 prompts<br/>with N pretend users"]
+    F --> G["Stop recording and save<br/>every request's timings to disk"]
 ```
 
-**The sweep** is 4 policies × 6 concurrency levels (8, 16, 24, 32, 48, 64) × 3 repeats = **72
-runs**. Inside each (repeat, concurrency) block the policy order is shuffled, so slow drift in the
-environment (GPU temperature, noisy neighbors on a shared cloud host) isn't mistaken for a policy
-effect.
+The full experiment is 4 rules × 6 user counts × 3 repeats = **72 runs**. The order of the rules
+is shuffled each time, so a slow change in the cloud machine (heat, noisy neighbors) can't
+favor one rule.
 
-**Per request**, the client records:
+For each request, the client records:
 
-- TTFT, the time of the first non-empty token;
-- every inter-token gap;
-- E2E latency;
-- token counts and `cached_tokens` from the engine's usage report;
-- the worker and routing reason from the router's `x-kvbench-*` response headers.
+- when the first word arrived;
+- the gaps between words;
+- when the last word arrived;
+- how many prompt tokens the server found cached;
+- which server the router picked.
 
-### 3.7 The analysis pipeline
+**Code:** `src/kvbench/bench/`.
+
+### 3.6 Turning the logs into the report
+
+`kvbench analyze` reads the saved logs. For each run it computes:
+
+- the latency percentiles;
+- the throughput;
+- how much prefill work was done and how much of it was avoidable;
+- how evenly the servers were loaded.
+
+It then averages across the 3 repeats (with confidence intervals) and writes `REPORT.md`,
+CSV tables and the charts used in Level 4.
+
+**Code:** `src/kvbench/analysis/`.
+
+### 3.7 Optional: disaggregated mode
+
+In disaggregated mode ([2.8](#28-disaggregated-serving-briefly)), one request makes two stops:
 
 ```mermaid
-flowchart LR
-    R1["requests.jsonl<br/>(per run)"] --> S["summarize_run<br/>percentiles, steady-state throughput,<br/>prefill accounting, load imbalance"]
-    R2["run.json<br/>engine counter deltas"] --> S
-    S --> AG["aggregate<br/>mean, std, 95% CI across repeats"]
-    AG --> PT["prefill table<br/>vs ideal infinite cache"]
-    AG --> ST["matched-latency throughput table"]
-    AG --> PL["charts"]
-    PT --> REP["REPORT.md + CSVs"]
-    ST --> REP
-    PL --> REP
+sequenceDiagram
+    participant R as Router
+    participant P as Reading server (prefill)
+    participant D as Writing server (decode)
+    R->>P: read this prompt, write just 1 word, and keep the memory
+    P-->>R: done, the memory stays on me, here is its address
+    R->>D: write the answer, fetch the prompt's memory from that address
+    D->>P: copy the KV memory over the network (NIXL)
+    D-->>R: answer streams back
 ```
 
-`kvbench analyze` can combine several result directories into one report, for example colocated
-vs disaggregated, or vLLM vs SGLang.
+- Prefix caching lives on the **reading** servers, so that's where the cache-aware rule is
+  applied.
+- The writing server is simply the least busy one.
+- This follows vLLM's NixlConnector protocol: the request carries `kv_transfer_params`,
+  `max_tokens = 1` for the reading step, and `do_remote_decode = true`.
 
-### 3.8 Testing
+**Code:** `_handle_disagg()` in `src/kvbench/router/app.py`.
 
-There are 43 tests (`pytest`, about 10 s, no GPU needed):
+### 3.8 Tests
 
-- **Unit tests** for prefix hashing, the index, every policy, the block manager, the simulator
-  engine, the workload generator, and the analysis math (percentiles, interpolation, flat-region
-  detection, prefill accounting).
-- **End-to-end tests** that start real router and simulator servers on local ports and push
-  requests through them.
+There are 43 automated tests (`make test`, about 10 seconds, no GPU needed):
+
+- **Small tests** check each part on its own: the IDs, the notebooks, every routing rule, the
+  simulator's memory, and the report math.
+- **End-to-end tests** start a real router and simulated servers and send requests through them.
 
 ---
 
@@ -534,7 +647,7 @@ There are 43 tests (`pytest`, about 10 s, no GPU needed):
 | Model | Qwen2.5-1.5B-Instruct, **2 replicas on the same GPU** (`--gpu-memory-utilization 0.40` each) |
 | KV cache per replica | Capped at **8,192 blocks = 131,072 tokens (≈ 3.5 GiB)** using `--num-gpu-blocks-override` |
 | Other engine limits | `--max-model-len 16384`, `--max-num-seqs 64` |
-| Router | `cache_aware` parameters as in [3.4](#cache_aware-in-detail), same host |
+| Router | `cache_aware` parameters as in [3.2, step 3](#step-3-estimate-the-wait-at-each-server-and-pick-the-shortest), same host |
 | Workload | The 1,000-prompt trace above, identical for every run |
 | Sweep | 4 policies × concurrency {8, 16, 24, 32, 48, 64} × 3 repeats = 72 runs, 72,000 requests |
 | Duration and errors | 3.4 hours of benchmarking, **0 failed requests** |
