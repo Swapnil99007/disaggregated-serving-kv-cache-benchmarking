@@ -621,8 +621,13 @@ sequenceDiagram
 - Prefix caching lives on the **reading** servers, so that's where the cache-aware rule is
   applied.
 - The writing server is simply the least busy one.
+- Both stops carry the **same request ID**. When the writing server has copied the memory, it
+  tells the reading server "done with request X" so that server can free it. If the IDs
+  differed, the reading server would hold every request's memory for two minutes and quickly
+  run out.
 - This follows vLLM's NixlConnector protocol: the request carries `kv_transfer_params`,
-  `max_tokens = 1` for the reading step, and `do_remote_decode = true`.
+  `max_tokens = 1` for the reading step, `do_remote_decode = true`, and a shared `X-Request-Id`
+  header.
 
 **Code:** `_handle_disagg()` in `src/kvbench/router/app.py`.
 
@@ -849,9 +854,9 @@ This study uses the same four simulated GPUs, organized three ways: 4 colocated 
 - **Cache-aware routing still matters in disaggregated mode.** On the prefill pool it raised the
   hit rate from 61.1% (round-robin, 2P+2D) to 72.5% (cumulative across concurrency levels).
 
-These results are from the simulator. The real vLLM disaggregated path (NixlConnector,
-`docker/compose.vllm-disagg.yml`) is implemented, but it needs at least two GPUs and hasn't been
-measured yet.
+These results are from the simulator. The real vLLM disaggregated path (NixlConnector) is
+implemented, but it needs at least two GPUs and hasn't been measured yet. The step-by-step
+procedure is in [RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md).
 
 ### 4.7 Limitations and threats to validity
 

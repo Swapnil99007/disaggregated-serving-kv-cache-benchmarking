@@ -124,8 +124,9 @@ kvbench bench --experiment configs/experiments/sglang.yaml
 kvbench analyze results/vllm/<ts> results/sglang/<ts> --baseline vllm-2w/round_robin
 ```
 
-Disaggregated vLLM (2 GPUs): `docker/compose.vllm-disagg.yml` or
-`scripts/vllm_disagg_baremetal.sh`, then `configs/experiments/vllm_disagg.yaml`.
+Disaggregated vLLM (2 GPUs): follow **[docs/RUN_DISAGG_2GPU.md](docs/RUN_DISAGG_2GPU.md)**
+(`scripts/vllm_disagg_baremetal.sh`, `configs/experiments/vllm_disagg.yaml` and the colocated
+baseline `configs/experiments/vllm_2gpu.yaml`), or use `docker/compose.vllm-disagg.yml`.
 
 ---
 

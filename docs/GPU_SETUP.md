@@ -8,7 +8,7 @@ The simulator runs everywhere. Real vLLM/SGLang numbers need a Linux box with an
 |---|---|---|
 | Routing policies (vLLM or SGLang) | 1× 24 GB GPU (L4, A10G, RTX 4090/3090) | 2 replicas of Qwen2.5-1.5B-Instruct share the GPU |
 | 4-replica routing | 1× 80 GB (A100/H100) or 2–4× 24 GB | `--profile x4` + `ROUTER_CONFIG=configs/router/vllm_x4.yaml` |
-| P/D disaggregation | 2 GPUs on one host | NixlConnector; NVLink helps but isn't required |
+| P/D disaggregation | 2 GPUs on one host | NixlConnector; NVLink helps but isn't required. Step by step: [RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md) |
 
 Two kinds of cloud:
 
@@ -94,8 +94,10 @@ Lessons from running this on RunPod:
 SGLang: `pip install "sglang[all]"` in its own env, then
 `SGLANG_PY=~/sglang-env/bin/python N=2 bash scripts/sglang_baremetal.sh`.
 
-P/D disaggregation: `pip install vllm nixl` in the engine env, then
-`PATH=~/vllm-env/bin:$PATH bash scripts/vllm_disagg_baremetal.sh`.
+P/D disaggregation (2 GPUs): add `"nixl==0.6.0"` to the engine-env install above, then follow
+**[RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md)**. It runs `scripts/vllm_disagg_baremetal.sh`
+(`check`, `prefill`, `decode`, `router`, `verify`), one tmux window per GPU, plus a colocated
+baseline on the same two GPUs.
 
 ## 5. Bring results home
 

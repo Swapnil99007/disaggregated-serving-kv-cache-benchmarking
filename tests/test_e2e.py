@@ -74,7 +74,17 @@ def test_disaggregated_end_to_end(port_factory):
     workers = [WorkerSpec(name="p", url=f"http://127.0.0.1:{pp}", backend="sim", role="prefill"),
                WorkerSpec(name="d", url=f"http://127.0.0.1:{pd}", backend="sim", role="decode")]
     cfg = _router_cfg(workers, mode="disagg")
-    with ServerThread(_sim(pp, "prefill"), pp), ServerThread(_sim(pd, "decode"), pd), ServerThread(create_router(cfg), pr):
+    seen: dict[str, list] = {"p": [], "d": []}
+    sim_p, sim_d = _sim(pp, "prefill"), _sim(pd, "decode")
+    for name, app in (("p", sim_p), ("d", sim_d)):
+        def record(name=name):
+            async def mw(request, call_next):
+                if request.url.path.startswith("/v1/"):
+                    seen[name].append(request.headers.get("x-request-id"))
+                return await call_next(request)
+            return mw
+        app.middleware("http")(record())
+    with ServerThread(sim_p, pp), ServerThread(sim_d, pd), ServerThread(create_router(cfg), pr):
         url = f"http://127.0.0.1:{pr}"
         results, _ = asyncio.run(run_closed_loop(group_conversations(_trace(12)), url, "kvbench-model", concurrency=3))
         assert all(r.status == "ok" for r in results), [r.error for r in results if r.status != "ok"]
@@ -85,3 +95,9 @@ def test_disaggregated_end_to_end(port_factory):
         wm = httpx.get(url + "/admin/worker_metrics").json()
         assert wm["d"]["metrics"]["sim:kv_tokens_transferred_total"] > 0
         assert wm["d"]["metrics"]["sim:prefill_tokens_computed_total"] <= 12   # ~1 token per request
+    # vLLM's NixlConnector frees the prefiller's KV by request id, so both legs of a request must
+    # carry the same X-Request-Id (and different requests different ids)
+    assert len(seen["p"]) == len(seen["d"]) == 12
+    # (compare as sorted lists: with 3 concurrent sessions, decode legs can arrive in a different order)
+    assert all(seen["p"]) and all(seen["d"]), "router must send X-Request-Id on both legs"
+    assert sorted(seen["p"]) == sorted(seen["d"]) and len(set(seen["p"])) == 12

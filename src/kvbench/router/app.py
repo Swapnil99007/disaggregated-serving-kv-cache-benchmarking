@@ -10,6 +10,12 @@ Disaggregated mode (vLLM NixlConnector-style protocol):
   3. Pick a *decode* worker (decode_policy) and send the original request plus
      those ``kv_transfer_params``; the decoder pulls the KV and streams tokens.
 
+  Both legs carry the same ``X-Request-Id`` header, so both engines derive the same internal
+  request id. vLLM's NixlConnector relies on that: after pulling the KV, the decoder notifies
+  the prefiller *by request id*, and the prefiller only frees the blocks of an id it knows.
+  Mismatched ids leave every request's KV pinned on the prefiller until
+  VLLM_NIXL_ABORT_REQUEST_TIMEOUT (120 s), which exhausts its KV pool within seconds.
+
 Every response carries ``x-kvbench-*`` headers (chosen worker, routing reason,
 predicted prefix match, and in disagg mode the prefill-side cached-token count)
 so the benchmark client can attribute results without parsing logs.
@@ -21,6 +27,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from collections import Counter
 from contextlib import asynccontextmanager
 
@@ -179,9 +186,9 @@ class Router:
         self.matched_chunks_sum += d.matched_chunks
         self.prompt_chunks_sum += len(rr.hashes)
 
-    async def _send(self, w: WorkerState, path: str, body: dict) -> httpx.Response:
+    async def _send(self, w: WorkerState, path: str, body: dict, headers: dict | None = None) -> httpx.Response:
         assert self.client is not None
-        req = self.client.build_request("POST", w.spec.url.rstrip("/") + path, json=body)
+        req = self.client.build_request("POST", w.spec.url.rstrip("/") + path, json=body, headers=headers)
         return await self.client.send(req, stream=True)
 
     async def _relay(self, resp: httpx.Response, lease: Lease, headers: dict, stream: bool) -> Response:
@@ -276,6 +283,9 @@ class Router:
             self.errors_total += 1
             return JSONResponse({"error": {"message": "no healthy prefill/decode workers"}}, status_code=503)
 
+        # one id for both legs (see module docstring: NixlConnector frees prefill KV by request id)
+        req_headers = {"X-Request-Id": f"kvb-{uuid.uuid4().hex}"}
+
         # 1) prefill
         pd = self.policy.select(rr, pre_pool)
         self._record_decision(pd, rr, t0)
@@ -290,7 +300,7 @@ class Router:
         tp = time.perf_counter()
         lease_p.accepted()   # mark before the (blocking) prefill call so concurrent same-prefix requests follow
         try:
-            presp = await self.client.post(pd.worker.spec.url.rstrip("/") + path, json=pbody)
+            presp = await self.client.post(pd.worker.spec.url.rstrip("/") + path, json=pbody, headers=req_headers)
         except httpx.TransportError as e:
             lease_p.release()
             pd.worker.errors_total += 1
@@ -318,7 +328,7 @@ class Router:
         if kvp:
             dbody["kv_transfer_params"] = kvp
         try:
-            resp = await self._send(dd.worker, path, dbody)
+            resp = await self._send(dd.worker, path, dbody, headers=req_headers)
         except httpx.TransportError as e:
             lease_d.release()
             dd.worker.errors_total += 1
@@ -334,6 +344,7 @@ class Router:
             "x-kvbench-matched-chunks": str(pd.matched_chunks),
             "x-kvbench-prompt-chunks": str(len(rr.hashes)),
             "x-kvbench-prefill-ms": f"{prefill_ms:.3f}",
+            "x-kvbench-request-id": req_headers["X-Request-Id"],
         }
         if p_prompt is not None:
             headers["x-kvbench-prefill-prompt-tokens"] = str(p_prompt)

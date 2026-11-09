@@ -1,0 +1,369 @@
+# Disaggregated prefill/decode on 2 real GPUs: step by step (RunPod)
+
+This runbook measures disaggregated serving on real hardware and compares it with ordinary
+(colocated) serving **on the same two GPUs, with the same engine settings**.
+
+| Phase | GPU 0 | GPU 1 | Result folder |
+|---|---|---|---|
+| **A. Disaggregated (1P + 1D)** | prefill server: reads every prompt | decode server: writes every answer, pulling the KV over NIXL | `results/vllm_disagg/<timestamp>` |
+| **B. Colocated (2 replicas)** | full replica 0 | full replica 1 | `results/vllm_2gpu/<timestamp>` |
+
+Both phases replay the same 1,000-prompt trace at 8–64 sessions with 3 repeats, using the
+`cache_aware` router. The engine settings match the single-GPU runs: Qwen2.5-1.5B-Instruct,
+vLLM 0.11.0, a KV cap of 8,192 blocks per instance, `--max-num-seqs 64`, and
+`--max-model-len 16384`.
+
+**Budget: about 3 hours and $3–5** for 2× RTX A6000.
+
+| Step | Time |
+|---|---|
+| 1. Rent the pod | 10 min |
+| 2. Install and pre-flight check | 20–25 min |
+| 3. Open the tmux windows | 2 min |
+| 4. Phase A: start servers, verify, run the sweep | 60–80 min |
+| 5. Switch phases | 3 min |
+| 6. Phase B: start replicas, run the sweep | 45–60 min |
+| 7. Copy results home, terminate | 5 min |
+
+Commands below contain no `#` comments, so every block can be pasted as is. Run each block in
+the window named above it.
+
+---
+
+## 1. Rent a pod with 2 GPUs
+
+1. Open the RunPod console and go to **Pods → Deploy**.
+2. Pick the GPU, and set **GPU count to 2**. Both GPUs must be in **one pod**; two separate pods
+   won't work. In order of preference:
+   1. **2× RTX A6000**: the same GPU as the single-GPU results.
+   2. 2× A40: the same generation as the A6000, with 48 GB.
+   3. 2× L40S or 2× RTX 6000 Ada.
+
+   **Avoid consumer cards** (RTX 3090, 4090, 5090). NIXL moves KV memory directly between the
+   two GPUs, and consumer cards often block GPU-to-GPU transfers in cloud containers.
+3. If there's a CUDA version filter, choose **12.8 or newer**. vLLM 0.11.0's wheels need it.
+4. **Template:** RunPod PyTorch.
+5. **Edit the pod settings:**
+   - set the container disk to **80 GB**;
+   - leave the volume disk at 0;
+   - no extra ports are needed.
+6. Choose **On-Demand**, not Spot. A Spot pod can be taken away in the middle of a run.
+7. Click **Deploy** and wait for **Running**. Then click **Connect** and copy the **SSH** command.
+
+> The container disk is **wiped when the pod stops**. Results only survive if you copy them
+> home (step 7) first.
+
+## 2. Install and pre-flight check
+
+**On your Mac**, paste the SSH command from RunPod.
+
+**On the pod:**
+
+```bash
+nvidia-smi -L
+```
+
+You must see **two** lines, `GPU 0: ...` and `GPU 1: ...`. If you see one, you rented a
+single-GPU pod; go back to step 1.
+
+```bash
+cd /workspace
+git clone https://github.com/Swapnil99007/disaggregated-serving-kv-cache-benchmarking.git
+cd disaggregated-serving-kv-cache-benchmarking
+git log --oneline -1
+```
+
+The last line must mention **2-GPU disaggregation**. That's the commit with the fixed router and
+launch script.
+
+Start tmux now, so a dropped SSH connection can't kill anything:
+
+```bash
+tmux new -s pd -n gpu0
+```
+
+Inside tmux (window `gpu0`), install the engine environment. This takes about 5–10 minutes:
+
+```bash
+cd /workspace/disaggregated-serving-kv-cache-benchmarking
+python3 -m venv ~/vllm-env
+~/vllm-env/bin/pip install -U pip
+~/vllm-env/bin/pip install vllm==0.11.0 "transformers==4.56.2" "openai>=1.99.1,<2" "nixl==0.6.0"
+```
+
+The versions are pinned on purpose. vLLM 0.11.0 crashes with newer `transformers`, and NIXL 0.6.0
+is the release that was current when vLLM 0.11.0 shipped.
+
+Then install the project itself in its own environment:
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e ".[gpu,dev]"
+pytest -q
+```
+
+Expected: **43 passed**.
+
+```bash
+kvbench gen-trace
+```
+
+The printed statistics must include **`"num_conversations": 369`** and
+**`"prompt_chars_total": 18047003.0`**. That confirms this is the same trace as the earlier runs.
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh check
+```
+
+Expected: **`ALL CHECKS PASSED`**. It checks:
+- two GPUs are present;
+- vLLM, transformers and NIXL are installed at the pinned versions, and NIXL imports;
+- the router has the request-ID fix;
+- all five ports are free.
+
+The "peer access" line is informational. Write down whether it says True or False; it matters
+only if step 4's verify fails.
+
+## 3. Open the tmux windows
+
+There are five windows. Each GPU gets its own window, so you can watch its server.
+
+| # | Window | Phase A | Phase B |
+|---|---|---|---|
+| 0 | `gpu0` | prefill server (GPU 0) | replicas + router launcher |
+| 1 | `gpu1` | decode server (GPU 1) | log of replica 1 (GPU 1) |
+| 2 | `router` | router | log of replica 0 (GPU 0) |
+| 3 | `bench` | verify + sweep | smoke + sweep |
+| 4 | `monitor` | `nvidia-smi` | `nvidia-smi` |
+
+Create them from window `gpu0`:
+
+```bash
+tmux new-window -d -n gpu1 -c /workspace/disaggregated-serving-kv-cache-benchmarking
+tmux new-window -d -n router -c /workspace/disaggregated-serving-kv-cache-benchmarking
+tmux new-window -d -n bench -c /workspace/disaggregated-serving-kv-cache-benchmarking
+tmux new-window -d -n monitor -c /workspace/disaggregated-serving-kv-cache-benchmarking
+```
+
+**tmux keys** (press Ctrl-b, release it, then press the next key):
+
+| Keys | Action |
+|---|---|
+| Ctrl-b then `0` … `4` | Switch to window 0 … 4 (the bottom bar shows which one you're in) |
+| Ctrl-b then `d` | Detach; everything keeps running. Reattach with `tmux attach -t pd` |
+| Ctrl-b then `[` | Scroll mode: arrow keys or PgUp; press `q` to leave |
+
+**Window 4 (`monitor`):**
+
+```bash
+watch -n 2 nvidia-smi
+```
+
+Leave it running. It shows memory use and utilization for both GPUs.
+
+## 4. Phase A: disaggregated, prefill on GPU 0 and decode on GPU 1
+
+**Window 0 (`gpu0`):**
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh prefill
+```
+
+**Window 1 (`gpu1`):**
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh decode
+```
+
+Each takes 2–4 minutes the first time, to download the weights and compile CUDA graphs. Wait
+until **both** windows show `Application startup complete.` The prefill window should also have
+printed `NIXL is available` near the start.
+
+**Window 2 (`router`):**
+
+```bash
+. .venv/bin/activate
+bash scripts/vllm_disagg_baremetal.sh router
+```
+
+It waits for both servers, then prints `router up: mode=disagg`.
+
+**Window 3 (`bench`):**
+
+```bash
+. .venv/bin/activate
+bash scripts/vllm_disagg_baremetal.sh verify
+```
+
+This takes about 30 seconds and must end with **`VERIFY PASSED: KV is moving from GPU 0 to GPU 1 over NIXL`**.
+It checks four things:
+- requests take the prefill → decode path;
+- the prefill server returns KV-transfer info;
+- the decode server's log reports `num_successful_transfers` above 0;
+- the prefill server logged no request-ID mismatches.
+
+**Don't start the sweep until verify passes.** If it fails, see
+[Troubleshooting](#troubleshooting).
+
+Then, still in **window 3**, run the sweep (18 runs, about 50–70 minutes):
+
+```bash
+kvbench bench --experiment configs/experiments/vllm_disagg.yaml
+```
+
+Each run prints a summary line. It's finished when it prints
+`report: results/vllm_disagg/<timestamp>/analysis/REPORT.md`. You can detach (Ctrl-b `d`)
+and come back later.
+
+Health check while it runs, from any free shell (for example, press Ctrl-C in `monitor`, then
+restart `watch` afterwards):
+
+```bash
+grep -c "Releasing expired KV blocks" logs/prefill.log
+```
+
+This must stay **0**.
+
+## 5. Switch from Phase A to Phase B
+
+Stop the Phase A processes in this order, with **Ctrl-C** in each window:
+1. window 2 (`router`);
+2. window 1 (`gpu1`);
+3. window 0 (`gpu0`).
+
+In window 4 (`monitor`), both GPUs should drop to about 0 MiB of memory used within a few
+seconds. If anything is still using memory, run this in window 3:
+
+```bash
+pkill -f vllm-env; pkill -f "kvbench router"
+```
+
+## 6. Phase B: colocated, one full replica per GPU
+
+**Window 0 (`gpu0`):**
+
+```bash
+. .venv/bin/activate
+VLLM_BIN=~/vllm-env/bin/vllm N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh
+```
+
+This starts replica 0 on GPU 0, then replica 1 on GPU 1, then the router, all from this window.
+It ends with `router up: mode=colocated`. It uses the same engine settings as Phase A, minus the
+KV connector.
+
+**Window 1 (`gpu1`)**, to watch replica 1:
+
+```bash
+tail -f logs/vllm1.log
+```
+
+**Window 2 (`router`)**, to watch replica 0:
+
+```bash
+tail -f logs/vllm0.log
+```
+
+**Window 3 (`bench`):**
+
+```bash
+kvbench smoke
+```
+
+All 6 lines should show `status=ok`, and the later turns of a conversation should show
+`cached=` above 0.
+
+```bash
+kvbench bench --experiment configs/experiments/vllm_2gpu.yaml
+```
+
+That's 18 runs, about 45–60 minutes. It's finished when it prints
+`report: results/vllm_2gpu/<timestamp>/analysis/REPORT.md`.
+
+**Optional, about 45–60 more minutes (about $1):** round-robin on the same setup. This measures
+routing gains with each replica on its own GPU, instead of two replicas sharing one GPU as in
+the single-GPU results.
+
+```bash
+kvbench bench --experiment configs/experiments/vllm_2gpu.yaml --policies round_robin
+```
+
+## 7. Copy the results home, then terminate
+
+**Window 3 (`bench`):**
+
+```bash
+cd /workspace/disaggregated-serving-kv-cache-benchmarking
+tar czf /tmp/pd_results.tgz results/vllm_disagg results/vllm_2gpu logs
+runpodctl send /tmp/pd_results.tgz
+```
+
+It prints a code like `1234-alpha-bravo-charlie`. **On your Mac:**
+
+```bash
+cd ~/Documents/Projects/llm-serving-benchmarking
+runpodctl receive 1234-alpha-bravo-charlie
+```
+
+Wait for the Mac to finish receiving the file, then terminate the pod in the RunPod console:
+**Pods → ⋮ → Terminate**.
+
+The combined comparison report is built from the received files:
+
+```bash
+kvbench analyze results/vllm_2gpu/<ts> results/vllm_disagg/<ts> --baseline vllm-2gpu-2w/cache_aware --out results/compare_pd_gpu
+```
+
+---
+
+## Troubleshooting
+
+**Collect diagnostics first.** This lets someone else look at the logs:
+
+```bash
+tail -n 80 logs/prefill.log logs/decode.log logs/router_disagg.log > /tmp/diag.txt
+runpodctl send /tmp/diag.txt
+```
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `check`: a version shows FAIL | Unpinned or partial install | Rerun the `~/vllm-env/bin/pip install ...` line from step 2 exactly |
+| `check`: `nixl import FAIL` | NIXL wheel missing or broken | `~/vllm-env/bin/pip install --force-reinstall "nixl==0.6.0"` |
+| `check`: `old router code` | The clone is from before the fix | `git pull`, then rerun `check` |
+| `ERROR: port ... is already in use` | A leftover server or router | `pkill -f vllm-env; pkill -f "kvbench router"`, then retry |
+| A server window exits with a traceback | Usually NIXL/UCX setup, or CUDA-graph capture with the connector | Collect diagnostics. Then try the eager fallback below |
+| verify: `prefill instance returned no KV-transfer info` | The connector isn't active on the prefill server | Check that window 0 printed `NIXL is available`. If not, fix the NIXL install |
+| verify: no `KV Transfer metrics` line | Transfers failing, or the stats line hasn't been printed yet | Wait 30 s and run `grep "KV Transfer metrics" logs/decode.log`. If still nothing, try the UCX fallback below |
+| `Releasing expired KV blocks` in `logs/prefill.log` | Prefill and decode disagree on request IDs, so the prefill server holds every request's KV for 120 s and stalls | Make sure `check` passed the router check (`git pull`), then restart the router |
+| Sweep requests time out | Usually the row above, or a crashed server | Check windows 0 and 1, then collect diagnostics |
+
+**Eager fallback.** Use this if a server dies while capturing CUDA graphs. It turns off CUDA
+graphs, so it must be applied to **both phases**, or the comparison isn't fair:
+
+```bash
+VLLM_EXTRA_ARGS="--num-gpu-blocks-override 8192 --enforce-eager" bash scripts/vllm_disagg_baremetal.sh prefill
+```
+
+Use the same prefix for `decode`, and in Phase B:
+
+```bash
+VLLM_EXTRA_ARGS="--num-gpu-blocks-override 8192 --enforce-eager" VLLM_BIN=~/vllm-env/bin/vllm N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh
+```
+
+**UCX fallback.** Use this if verify shows no transfers, or the logs mention UCX transport errors,
+especially when `check` reported peer access as False. It stages the KV through host memory
+over TCP: slower, but it doesn't need direct GPU-to-GPU access. Restart prefill and decode with:
+
+```bash
+UCX_TLS=tcp,cuda_copy bash scripts/vllm_disagg_baremetal.sh prefill
+```
+
+and the same prefix for `decode`. Record this setting with the results, because it makes KV
+transfers slower than direct GPU-to-GPU copies.
+
+**Stop-loss.** If Phase A still fails after about 45 minutes of trying:
+1. collect diagnostics;
+2. copy home anything you have (step 7);
+3. terminate the pod.
+
+There's no point paying for idle GPUs while the logs are being read.

@@ -1,0 +1,22 @@
+# Colocated baseline for the disaggregation study: 2 vLLM replicas, ONE PER GPU, on the same
+# 2 GPUs and with the same engine settings as scripts/vllm_disagg_baremetal.sh.
+# Launch: N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh  (walkthrough: docs/RUN_DISAGG_2GPU.md)
+# Optional: add round_robin (--policies cache_aware,round_robin) to also measure routing gains
+# with each replica on its own GPU.
+name: vllm_2gpu
+deployment: vllm-2gpu-2w
+router_url: http://localhost:8000
+model: kvbench-model
+trace:
+  path: traces/rag_1000.jsonl
+  workload: configs/workloads/rag_default.yaml
+policies: [cache_aware]
+concurrency: [8, 16, 24, 32, 48, 64]
+repeats: 3
+warmup: {engine_requests: 16, prefix_warmup_prompts: 0}
+flush_between_runs: true
+request: {ignore_eos: true, temperature: 0.0, timeout_s: 900}
+telemetry: {interval_s: 0.5, nvml: true}
+ready_timeout_s: 1800
+output_dir: results
+analysis: {baseline_policy: round_robin, slo_metric: e2e, slo_percentile: 95, slo_target_s: null, chunk_chars: 256}
