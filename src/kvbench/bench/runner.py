@@ -89,6 +89,23 @@ async def _admin(client: httpx.AsyncClient, url: str, path: str, body: dict | No
     return r.json()
 
 
+async def _cold_reset(client: httpx.AsyncClient, url: str, flush: bool, settle_s: float = 3.0) -> None:
+    """Clear the router index and (optionally) flush every engine's prefix cache.
+
+    vLLM refuses to reset its prefix cache while any block is still referenced, and answers
+    HTTP 200 either way. With P/D disaggregation the prefill engine keeps a finished request's
+    blocks until the decoder confirms the KV transfer, so a flush issued right after a burst of
+    requests can silently do nothing. Wait for in-flight releases to settle, then flush twice.
+    """
+    if not flush:
+        await _admin(client, url, "/admin/reset", {"flush_workers": False})
+        return
+    await asyncio.sleep(settle_s)
+    await _admin(client, url, "/admin/reset", {"flush_workers": True})
+    await asyncio.sleep(1.0)
+    await _admin(client, url, "/admin/reset", {"flush_workers": True})
+
+
 async def engine_warmup(url: str, model: str, n: int) -> None:
     rng = random.Random(1234)
     reqs = [
@@ -137,11 +154,11 @@ async def run_one(cfg: ExperimentConfig, client: httpx.AsyncClient, convs: list[
     label = f"{cfg.deployment}/{policy}"
     await _admit_policy(client, url, policy, cfg.decode_policy)
     if cfg.flush_between_runs:
-        await _admin(client, url, "/admin/reset", {"flush_workers": True})
+        await _cold_reset(client, url, True)
     n_ew = int(cfg.warmup.get("engine_requests") or 0)
     if n_ew:
         await engine_warmup(url, cfg.model, n_ew)
-        await _admin(client, url, "/admin/reset", {"flush_workers": cfg.flush_between_runs})
+        await _cold_reset(client, url, cfg.flush_between_runs)
     if warm_convs:
         _log(f"  prefix warm-up: {sum(len(c) for c in warm_convs)} prompts")
         await run_closed_loop(warm_convs, url, cfg.model, min(conc, 16), cfg.request.get("ignore_eos", True))

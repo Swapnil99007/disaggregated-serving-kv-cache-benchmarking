@@ -4,6 +4,8 @@
 # Run each part in its own tmux window (full walkthrough: docs/RUN_DISAGG_2GPU.md):
 #
 #   bash scripts/vllm_disagg_baremetal.sh check     # pre-flight: GPUs, versions, NIXL, ports
+#   bash scripts/vllm_disagg_baremetal.sh p2ptest   # 45 s of GPU0<->GPU1 copies; catches hosts whose
+#                                                   # PCIe can't sustain direct GPU-to-GPU traffic
 #   bash scripts/vllm_disagg_baremetal.sh prefill   # prefill instance on GPU 0 (stays in foreground)
 #   bash scripts/vllm_disagg_baremetal.sh decode    # decode instance on GPU 1 (stays in foreground)
 #   bash scripts/vllm_disagg_baremetal.sh router    # waits for both instances, then runs the router
@@ -61,6 +63,17 @@ require_free() {
   fi
 }
 
+gpu_healthy() {   # false if nvidia-smi shows a GPU in an error state (fallen off the bus, Xid, ...)
+  local out
+  out=$(nvidia-smi 2>&1) || { echo "  FAIL: nvidia-smi failed: $(echo "$out" | head -n 1)"; return 1; }
+  if echo "$out" | grep -q "ERR!"; then
+    echo "  FAIL: nvidia-smi shows ERR! on a GPU. That GPU has stopped responding; this pod can't"
+    echo "        recover. Save logs, terminate the pod and deploy a new one (see the runbook)."
+    return 1
+  fi
+  echo "  all GPUs healthy"
+}
+
 ready() {   # only accept OUR server: /v1/models must list the served model name
   curl -sf --max-time 5 "localhost:$1/v1/models" 2>/dev/null | grep -q kvbench-model
 }
@@ -71,6 +84,7 @@ cmd_check() {
   nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader || ok=0
   n=$(nvidia-smi -L 2>/dev/null | wc -l)
   if [ "$n" -lt 2 ]; then echo "  FAIL: need 2 GPUs, found $n"; ok=0; fi
+  gpu_healthy || ok=0
   echo "== GPU interconnect (informational)"
   nvidia-smi topo -m 2>/dev/null | head -n 3 || echo "  (topology not available in this container)"
   echo "== engine env: $VLLM_PY"
@@ -170,6 +184,8 @@ cmd_router() {
 
 cmd_verify() {
   local ok=1 hdrs n_err xfer
+  echo "== GPU health"
+  gpu_healthy || ok=0
   echo "== router"
   curl -sf --max-time 5 "localhost:$ROUTER_PORT/health" || { echo "  FAIL: router not answering on :$ROUTER_PORT"; exit 1; }
   echo
@@ -192,15 +208,64 @@ cmd_verify() {
   n_err=$(grep -c -E "Releasing expired KV blocks|unrecognized request" "$LOG_DIR/prefill.log" || true)
   echo "  $n_err"
   [ "${n_err:-0}" = 0 ] || ok=0
+  echo "== GPU health after the transfers"
+  gpu_healthy || ok=0
   if [ "$ok" = 1 ]; then echo; echo "VERIFY PASSED: KV is moving from GPU $PREFILL_GPU to GPU $DECODE_GPU over NIXL"
   else echo; echo "VERIFY FAILED (see FAIL lines above)"; exit 1; fi
 }
 
+cmd_p2ptest() {
+  local rc
+  [ -x "$VLLM_PY" ] || { echo "ERROR: $VLLM_PY not found; run the install step"; exit 1; }
+  echo "== GPU health before"
+  gpu_healthy || exit 1
+  echo "== 45 s of copies GPU $PREFILL_GPU <-> GPU $DECODE_GPU (the same path NIXL uses; Ctrl-C is safe)"
+  set +e
+  CUDA_VISIBLE_DEVICES=$PREFILL_GPU,$DECODE_GPU timeout 150 "$VLLM_PY" - <<'EOF'
+import time
+
+import torch
+
+print(f"  peer access 0->1: {torch.cuda.can_device_access_peer(0, 1)}, 1->0: {torch.cuda.can_device_access_peer(1, 0)}")
+n = 64 * 1024 * 1024                      # 256 MB of float32 per buffer
+a = torch.randn(n, device="cuda:0")
+b = torch.empty(n, device="cuda:1")
+ref = a[:4096].cpu()
+t0, moved, last = time.time(), 0, 0.0
+while time.time() - t0 < 45:
+    b.copy_(a)                            # GPU0 -> GPU1 (peer-to-peer when enabled)
+    a.copy_(b)                            # GPU1 -> GPU0
+    torch.cuda.synchronize(0)
+    torch.cuda.synchronize(1)
+    moved += 2 * n * 4
+    if time.time() - last > 10:
+        last = time.time()
+        print(f"  {time.time() - t0:4.0f} s  {moved / 1e9:7.0f} GB copied", flush=True)
+dt = time.time() - t0
+assert torch.equal(a[:4096].cpu(), ref), "data corrupted in transit"
+print(f"  copied {moved / 1e9:.0f} GB in {dt:.0f} s ({moved / 1e9 / dt:.1f} GB/s), data intact")
+EOF
+  rc=$?
+  set -e
+  echo "== GPU health after"
+  if [ "$rc" = 0 ] && gpu_healthy; then
+    echo; echo "P2P TEST PASSED: use the default (direct GPU-to-GPU) transfer path"
+  else
+    [ "$rc" = 124 ] && echo "  FAIL: copies hung (timed out)"
+    [ "$rc" != 0 ] && [ "$rc" != 124 ] && echo "  FAIL: copy test exited with code $rc"
+    echo; echo "P2P TEST FAILED: this host can't sustain direct GPU-to-GPU copies."
+    echo "If a GPU now shows ERR!, terminate this pod and deploy another; on the next pod skip"
+    echo "this test and start prefill/decode with UCX_TLS=tcp,cuda_copy (see the runbook)."
+    exit 1
+  fi
+}
+
 case "${1:-}" in
   check)   cmd_check ;;
+  p2ptest) cmd_p2ptest ;;
   prefill) serve prefill "$PREFILL_GPU" "$PREFILL_PORT" "$PREFILL_NIXL_PORT" ;;
   decode)  serve decode "$DECODE_GPU" "$DECODE_PORT" "$DECODE_NIXL_PORT" ;;
   router)  cmd_router ;;
   verify)  cmd_verify ;;
-  *) echo "usage: bash $0 {check|prefill|decode|router|verify}"; exit 2 ;;
+  *) echo "usage: bash $0 {check|p2ptest|prefill|decode|router|verify}"; exit 2 ;;
 esac

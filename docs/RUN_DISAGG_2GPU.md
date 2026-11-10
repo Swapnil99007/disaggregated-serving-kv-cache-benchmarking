@@ -19,7 +19,7 @@ that only sets memory headroom, not speed.
 | Step | Time |
 |---|---|
 | 1. Rent the pod | 10 min |
-| 2. Install and pre-flight check | 20–25 min |
+| 2. Install, pre-flight check, GPU-to-GPU test | 20–25 min |
 | 3. Open the tmux windows | 2 min |
 | 4. Phase A: start servers, verify, run the sweep | 60–80 min |
 | 5. Switch phases | 3 min |
@@ -173,6 +173,21 @@ Expected: **`ALL CHECKS PASSED`**. It checks:
 The "peer access" line is informational. Write down whether it says True or False; it matters
 only if step 4's verify fails.
 
+Then stress-test the GPU-to-GPU path. That's the same path NIXL uses, and some hosts report peer
+access as True but can't sustain the traffic. It takes about 1 minute:
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh p2ptest
+```
+
+What the result means:
+- **`P2P TEST PASSED`**: continue normally.
+- **`P2P TEST FAILED`, but no GPU shows `ERR!`**: continue, but start the prefill and decode
+  servers in step 4 with the UCX fallback (`UCX_TLS=tcp,cuda_copy`, see
+  [Troubleshooting](#troubleshooting)).
+- **A GPU shows `ERR!`**: that host is broken. Terminate the pod and deploy another. On the next
+  pod, skip this test and use the UCX fallback from the start.
+
 ## 3. Open the tmux windows
 
 There are five windows. Each GPU gets its own window, so you can watch its server.
@@ -271,7 +286,8 @@ restart `watch` afterwards):
 grep -c "Releasing expired KV blocks" logs/prefill.log
 ```
 
-This must stay **0**.
+This must stay **0**. Also check `nvidia-smi` in window 4: neither GPU may show `ERR!`. And
+window 3 should print a progress line (`... 100/1000 (10%)`) every couple of minutes.
 
 ## 5. Switch from Phase A to Phase B
 
@@ -385,6 +401,7 @@ runpodctl send /tmp/diag.txt
 | verify: no `KV Transfer metrics` line | Transfers failing, or the stats line hasn't been printed yet | Wait 30 s and run `grep "KV Transfer metrics" logs/decode.log`. If still nothing, try the UCX fallback below |
 | `Releasing expired KV blocks` in `logs/prefill.log` | Prefill and decode disagree on request IDs, so the prefill server holds every request's KV for 120 s and stalls | Make sure `check` passed the router check (`git pull`), then restart the router |
 | Sweep requests time out | Usually the row above, or a crashed server | Check windows 0 and 1, then collect diagnostics |
+| Sweep stalls: no progress line for 5+ min, decode log shows `Running: N reqs` with `generation throughput: 0.0`, and `nvidia-smi` shows **`ERR!`** on a GPU | That GPU stopped responding (hardware fault, or a host that can't sustain GPU-to-GPU traffic). The pod can't recover | Save logs (`nvidia-smi -q -i 1 > logs/gpu1_state.txt`, then send `logs/` home), terminate, deploy a new pod, and run `p2ptest` there before anything else |
 
 **Eager fallback.** Use this if a server dies while capturing CUDA graphs. It turns off CUDA
 graphs, so it must be applied to **both phases**, or the comparison isn't fair:
