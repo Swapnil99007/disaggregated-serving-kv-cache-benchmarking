@@ -115,11 +115,11 @@ mkdir -p /workspace
 cd /workspace
 git clone https://github.com/Swapnil99007/disaggregated-serving-kv-cache-benchmarking.git
 cd disaggregated-serving-kv-cache-benchmarking
-git log --oneline -1
+git log --oneline -5
 ```
 
-The last line must mention **2-GPU disaggregation**. That's the commit with the fixed router and
-launch script.
+One of the lines must mention **2-GPU disaggregation**. That's the commit with the fixed router and
+launch script. The `check` step below confirms it as well.
 
 Start tmux now, so a dropped SSH connection can't kill anything:
 
