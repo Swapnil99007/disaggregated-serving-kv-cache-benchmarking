@@ -61,6 +61,42 @@ the window named above it.
 > The container disk is **wiped when the pod stops**. Results only survive if you copy them
 > home (step 7) first.
 
+### Renting on Vast.ai instead
+
+Vast.ai works too. Everything from step 2 on is the same, except for the points below.
+
+1. **Before renting:** add your SSH public key under **Account → SSH Keys**. On a Mac, print
+   it with `cat ~/.ssh/id_ed25519.pub`. If that file doesn't exist, create a key with
+   `ssh-keygen -t ed25519`.
+2. **Filters:** GPU count **2**, GPU type RTX A6000 / A40 / L40S, **Max CUDA ≥ 12.8**,
+   **verified**, reliability above 98%, **on-demand** (not interruptible).
+3. **Template:** a PyTorch image with CUDA 12.8 or newer, launch mode **SSH**, disk **60–80 GB**.
+   The disk size can't be changed after renting.
+4. **Vast starts tmux automatically when you log in.** Turn that off once, so the guide's own
+   tmux session isn't nested inside it:
+
+   ```bash
+   touch ~/.no_auto_tmux
+   exit
+   ```
+
+   Then connect again.
+5. If `python3 -m venv` says `ensurepip is not available`, run:
+
+   ```bash
+   apt-get update && apt-get install -y python3-venv
+   ```
+
+6. **Step 7:** there's no `runpodctl`. Copy the results from your **Mac** with the port and IP
+   shown on the instance card:
+
+   ```bash
+   scp -P PORT root@IP:/tmp/pd_results.tgz ~/Documents/Projects/llm-serving-benchmarking/
+   ```
+
+7. **When you're done:** click **Destroy**, not just Stop. A stopped instance keeps charging for
+   its disk.
+
 ## 2. Install and pre-flight check
 
 **On your Mac**, paste the SSH command from RunPod.
