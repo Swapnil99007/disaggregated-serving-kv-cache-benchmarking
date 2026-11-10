@@ -51,7 +51,8 @@ the window named above it.
 3. If there's a CUDA version filter, choose **12.8 or newer**. vLLM 0.11.0's wheels need it.
 4. **Template:** RunPod PyTorch.
 5. **Edit the pod settings:**
-   - set the container disk to **80 GB**;
+   - set the container disk to **80 GB** if the GPUs stay available at that size, otherwise
+     **50 GB** (enough, with the cache-free install below);
    - leave the volume disk at 0;
    - no extra ports are needed.
 6. Choose **On-Demand**, not Spot. A Spot pod can be taken away in the middle of a run.
@@ -74,6 +75,7 @@ You must see **two** lines, `GPU 0: ...` and `GPU 1: ...`. If you see one, you r
 single-GPU pod; go back to step 1.
 
 ```bash
+mkdir -p /workspace
 cd /workspace
 git clone https://github.com/Swapnil99007/disaggregated-serving-kv-cache-benchmarking.git
 cd disaggregated-serving-kv-cache-benchmarking
@@ -94,8 +96,8 @@ Inside tmux (window `gpu0`), install the engine environment. This takes about 5â
 ```bash
 cd /workspace/disaggregated-serving-kv-cache-benchmarking
 python3 -m venv ~/vllm-env
-~/vllm-env/bin/pip install -U pip
-~/vllm-env/bin/pip install vllm==0.11.0 "transformers==4.56.2" "openai>=1.99.1,<2" "nixl==0.6.0"
+~/vllm-env/bin/pip install --no-cache-dir -U pip
+~/vllm-env/bin/pip install --no-cache-dir vllm==0.11.0 "transformers==4.56.2" "openai>=1.99.1,<2" "nixl==0.6.0"
 ```
 
 The versions are pinned on purpose. vLLM 0.11.0 crashes with newer `transformers`, and NIXL 0.6.0
@@ -106,11 +108,12 @@ Then install the project itself in its own environment:
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
-pip install -e ".[gpu,dev]"
+pip install --no-cache-dir -e ".[gpu,dev]"
 pytest -q
+df -h /
 ```
 
-Expected: **43 passed**.
+Expected: **43 passed**, and `df` should show at least 15 GB still available.
 
 ```bash
 kvbench gen-trace
