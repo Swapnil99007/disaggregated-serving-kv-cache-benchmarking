@@ -11,9 +11,10 @@ This runbook measures disaggregated serving on real hardware and compares it wit
 Both phases replay the same 1,000-prompt trace at 8–64 sessions with 3 repeats, using the
 `cache_aware` router. The engine settings match the single-GPU runs: Qwen2.5-1.5B-Instruct,
 vLLM 0.11.0, a KV cap of 8,192 blocks per instance, `--max-num-seqs 64`, and
-`--max-model-len 16384`.
+`--max-model-len 16384`. Both phases use `GPU_MEM_UTIL=0.80`. With the KV cache size fixed,
+that only sets memory headroom, not speed.
 
-**Budget: about 3 hours and $3–5** for 2× RTX A6000.
+**Budget: about 3 hours**: roughly $3.50 on 2× RTX A6000 or 2× RTX PRO 4000, and about $15 on 2× RTX PRO 6000.
 
 | Step | Time |
 |---|---|
@@ -33,14 +34,20 @@ the window named above it.
 ## 1. Rent a pod with 2 GPUs
 
 1. Open the RunPod console and go to **Pods → Deploy**.
-2. Pick the GPU, and set **GPU count to 2**. Both GPUs must be in **one pod**; two separate pods
-   won't work. In order of preference:
-   1. **2× RTX A6000**: the same GPU as the single-GPU results.
-   2. 2× A40: the same generation as the A6000, with 48 GB.
+2. Pick the GPU, and set **GPU count to 2**. Only GPU types showing **"2 max" or more** can do
+   this. Both GPUs must be in **one pod**; two separate pods won't work. In order of preference:
+   1. **2× RTX A6000** or **2× A40**: the same GPU class as the single-GPU results.
+   2. **2× RTX PRO 4000** (24 GB): similar speed to the A6000, and the cheapest option.
    3. 2× L40S or 2× RTX 6000 Ada.
+   4. 2× RTX PRO 6000 (96 GB): works, but it's 2–3× faster than the A6000, so the 1.5B model may
+      not get busy enough at 64 sessions for a clear comparison.
 
-   **Avoid consumer cards** (RTX 3090, 4090, 5090). NIXL moves KV memory directly between the
-   two GPUs, and consumer cards often block GPU-to-GPU transfers in cloud containers.
+   **Avoid:**
+   - **consumer cards** (RTX 3090, 4090, 5090). NIXL moves KV memory directly between the two
+     GPUs, and NVIDIA blocks GPU-to-GPU transfers on consumer cards;
+   - **"MIG" entries**. These are slices of one physical GPU, not two GPUs, and transfers between
+     slices aren't supported;
+   - **H100, H200, B200**. They work, but cost 5–15× more and are far bigger than this model needs.
 3. If there's a CUDA version filter, choose **12.8 or newer**. vLLM 0.11.0's wheels need it.
 4. **Template:** RunPod PyTorch.
 5. **Edit the pod settings:**
@@ -245,7 +252,7 @@ pkill -f vllm-env; pkill -f "kvbench router"
 
 ```bash
 . .venv/bin/activate
-VLLM_BIN=~/vllm-env/bin/vllm N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh
+GPU_MEM_UTIL=0.80 VLLM_BIN=~/vllm-env/bin/vllm N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh
 ```
 
 This starts replica 0 on GPU 0, then replica 1 on GPU 1, then the router, all from this window.
@@ -347,7 +354,7 @@ VLLM_EXTRA_ARGS="--num-gpu-blocks-override 8192 --enforce-eager" bash scripts/vl
 Use the same prefix for `decode`, and in Phase B:
 
 ```bash
-VLLM_EXTRA_ARGS="--num-gpu-blocks-override 8192 --enforce-eager" VLLM_BIN=~/vllm-env/bin/vllm N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh
+VLLM_EXTRA_ARGS="--num-gpu-blocks-override 8192 --enforce-eager" GPU_MEM_UTIL=0.80 VLLM_BIN=~/vllm-env/bin/vllm N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh
 ```
 
 **UCX fallback.** Use this if verify shows no transfers, or the logs mention UCX transport errors,

@@ -20,7 +20,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-Qwen/Qwen2.5-1.5B-Instruct}
-GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.40}
+# one instance per GPU; the KV cache size is fixed by --num-gpu-blocks-override, so this only
+# sets headroom (0.40 is too tight on 24 GB cards). Use the same value for the colocated phase.
+GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.80}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-16384}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-64}
 VLLM_EXTRA_ARGS=${VLLM_EXTRA_ARGS:---num-gpu-blocks-override 8192}
