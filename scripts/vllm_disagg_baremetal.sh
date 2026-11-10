@@ -11,7 +11,7 @@
 #
 # Engine env (its own venv; pinned to the versions vLLM 0.11.0 was released with):
 #   python3 -m venv ~/vllm-env
-#   ~/vllm-env/bin/pip install vllm==0.11.0 "transformers==4.56.2" "openai>=1.99.1,<2" "nixl==0.6.0"
+#   ~/vllm-env/bin/pip install vllm==0.11.0 "transformers==4.56.2" "openai>=1.99.1,<2" "nixl==0.6.0" hf_transfer
 #
 # Engine settings match scripts/vllm_baremetal.sh (model, KV cap of 8192 blocks per instance,
 # max-model-len, max-num-seqs) so colocated and disaggregated runs on the same GPUs are comparable.
@@ -92,6 +92,15 @@ for pkg, v in want.items():
     status = "ok" if have == v else "FAIL"
     bad |= status != "ok"
     print(f"  {pkg:13s} {have} (want {v})  {status}")
+import os
+if os.environ.get("HF_HUB_ENABLE_HF_TRANSFER", "").lower() in ("1", "true", "yes"):
+    try:
+        import hf_transfer  # noqa: F401
+        print("  hf_transfer   ok (HF_HUB_ENABLE_HF_TRANSFER is set)")
+    except ImportError:
+        print("  hf_transfer   FAIL: HF_HUB_ENABLE_HF_TRANSFER=1 but the package is missing;"
+              " model downloads will fail. Fix: ~/vllm-env/bin/pip install hf_transfer")
+        bad = True
 try:
     from nixl._api import nixl_agent  # noqa: F401  (what vLLM 0.11.0's NixlConnector imports)
     print("  nixl import   ok")

@@ -133,9 +133,11 @@ Inside tmux (window `gpu0`), install the engine environment. This takes about 5â
 cd /workspace/disaggregated-serving-kv-cache-benchmarking
 python3 -m venv ~/vllm-env
 ~/vllm-env/bin/pip install --no-cache-dir -U pip
-~/vllm-env/bin/pip install --no-cache-dir vllm==0.11.0 "transformers==4.56.2" "openai>=1.99.1,<2" "nixl==0.6.0"
+~/vllm-env/bin/pip install --no-cache-dir vllm==0.11.0 "transformers==4.56.2" "openai>=1.99.1,<2" "nixl==0.6.0" hf_transfer
 ```
 
+`hf_transfer` is there because RunPod's PyTorch template sets `HF_HUB_ENABLE_HF_TRANSFER=1`.
+Without the package, every model download fails with `Can't load the configuration of 'Qwen/...'`.
 The versions are pinned on purpose. vLLM 0.11.0 crashes with newer `transformers`, and NIXL 0.6.0
 is the release that was current when vLLM 0.11.0 shipped.
 
@@ -375,6 +377,7 @@ runpodctl send /tmp/diag.txt
 |---|---|---|
 | `check`: a version shows FAIL | Unpinned or partial install | Rerun the `~/vllm-env/bin/pip install ...` line from step 2 exactly |
 | `check`: `nixl import FAIL` | NIXL wheel missing or broken | `~/vllm-env/bin/pip install --force-reinstall "nixl==0.6.0"` |
+| A server exits with `Can't load the configuration of 'Qwen/Qwen2.5-1.5B-Instruct'` | The template sets `HF_HUB_ENABLE_HF_TRANSFER=1`, but `hf_transfer` isn't installed | `~/vllm-env/bin/pip install --no-cache-dir hf_transfer`, then restart both servers |
 | `check`: `old router code` | The clone is from before the fix | `git pull`, then rerun `check` |
 | `ERROR: port ... is already in use` | A leftover server or router | `pkill -f vllm-env; pkill -f "kvbench router"`, then retry |
 | A server window exits with a traceback | Usually NIXL/UCX setup, or CUDA-graph capture with the connector | Collect diagnostics. Then try the eager fallback below |
