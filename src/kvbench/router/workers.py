@@ -75,6 +75,7 @@ class WorkerState:
     inflight: int = 0
     prefill_inflight: int = 0          # dispatched, first token not yet seen
     pending_prefill_tokens: float = 0.0
+    admitted: int = 0                  # disagg decode: requests holding an admission slot
     routed_total: int = 0
     errors_total: int = 0
     # prediction quality (fraction of the prompt predicted cached vs reported cached)
@@ -119,6 +120,8 @@ class WorkerState:
             "inflight": self.inflight,
             "prefill_inflight": self.prefill_inflight,
             "pending_prefill_tokens": round(self.pending_prefill_tokens, 1),
+            "admitted": self.admitted,
+            "max_inflight": self.spec.max_inflight,
             "routed_total": self.routed_total,
             "errors_total": self.errors_total,
             "engine_running": self.engine_running,

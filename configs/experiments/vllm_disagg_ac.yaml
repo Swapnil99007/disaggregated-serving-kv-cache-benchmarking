@@ -1,0 +1,24 @@
+# Same as vllm_disagg.yaml, but the router caps the decode instance at 32 requests in flight
+# (decode admission control). Start the router with:
+#   DECODE_MAX_INFLIGHT=32 bash scripts/vllm_disagg_baremetal.sh router
+# Without the cap, 48+ sessions fill the decode KV pool (100%) and the pipeline stalls; at 32
+# sessions decode KV peaked at ~77%, so 32 is the largest tested load that never filled it.
+# 32 sessions never hit the cap (anchor point, should match vllm_disagg); 48 and 64 queue at the router.
+name: vllm_disagg_ac
+deployment: vllm-disagg-1p1d-ac32
+router_url: http://localhost:8000
+model: kvbench-model
+trace:
+  path: traces/rag_1000.jsonl
+  workload: configs/workloads/rag_default.yaml
+policies: [cache_aware]
+decode_policy: least_loaded
+concurrency: [32, 48, 64]
+repeats: 3
+warmup: {engine_requests: 16, prefix_warmup_prompts: 0}
+flush_between_runs: true
+request: {ignore_eos: true, temperature: 0.0, timeout_s: 900}
+telemetry: {interval_s: 0.5, nvml: true}
+ready_timeout_s: 1800
+output_dir: results
+analysis: {baseline_policy: cache_aware, slo_metric: e2e, slo_percentile: 95, slo_target_s: null, chunk_chars: 256}

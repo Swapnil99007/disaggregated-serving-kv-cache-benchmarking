@@ -12,6 +12,12 @@
 #   bash scripts/vllm_disagg_baremetal.sh verify    # proves KV really moves between the GPUs
 #   bash scripts/vllm_disagg_baremetal.sh soak      # ~2 min of real load + GPU health check
 #
+# Decode admission control (DECODE_MAX_INFLIGHT, router only; default off):
+#   DECODE_MAX_INFLIGHT=32 bash scripts/vllm_disagg_baremetal.sh router
+#   At most 32 requests hold the decode instance at once; the rest wait in the router BEFORE
+#   their prefill. Without it, past ~32 sessions the decode KV pool fills (100%), the pipeline
+#   stalls, and KV the prefiller held too long expires (measured: docs/RUN_DISAGG_2GPU.md).
+#
 # KV transfer path (KV_PATH):
 #   staged (default)  UCX_TLS=tcp,cuda_copy: each GPU only copies to/from host memory; the KV
 #                     crosses between engines through RAM. Works on any PCIe host.
@@ -49,6 +55,7 @@ PREFILL_NIXL_PORT=${PREFILL_NIXL_PORT:-5600}   # NIXL handshake (side channel); 
 DECODE_NIXL_PORT=${DECODE_NIXL_PORT:-5601}
 ROUTER_PORT=${ROUTER_PORT:-8000}
 KV_PATH=${KV_PATH:-staged}
+DECODE_MAX_INFLIGHT=${DECODE_MAX_INFLIGHT:-}
 LOG_DIR=${LOG_DIR:-logs}
 KV_CFG='{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
 mkdir -p "$LOG_DIR"
@@ -192,8 +199,11 @@ cmd_router() {
   cfg="$LOG_DIR/router_vllm_disagg_local.yaml"
   sed '/^workers:/q' configs/router/vllm_disagg.yaml > "$cfg"
   echo "  - {name: prefill0, url: \"http://127.0.0.1:$PREFILL_PORT\", backend: vllm, role: prefill}" >> "$cfg"
-  echo "  - {name: decode0, url: \"http://127.0.0.1:$DECODE_PORT\", backend: vllm, role: decode}" >> "$cfg"
+  local cap=""
+  if [ -n "$DECODE_MAX_INFLIGHT" ]; then cap=", max_inflight: $DECODE_MAX_INFLIGHT"; fi
+  echo "  - {name: decode0, url: \"http://127.0.0.1:$DECODE_PORT\", backend: vllm, role: decode$cap}" >> "$cfg"
   echo "router config: $cfg"
+  echo "decode admission cap (DECODE_MAX_INFLIGHT): ${DECODE_MAX_INFLIGHT:-off}"
   echo "starting the router on :$ROUTER_PORT (log also in $LOG_DIR/router_disagg.log); Ctrl-C stops it"
   "$KVBENCH_BIN" router --config "$cfg" --port "$ROUTER_PORT" 2>&1 | tee "$LOG_DIR/router_disagg.log"
 }

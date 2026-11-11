@@ -13,4 +13,5 @@ policy_params:
   cache_aware: {prefill_tps: 20000, decode_cost_s: 0.0, mem_high_watermark: 0.9, mem_penalty_s: 1.0, imbalance_abs: 8, imbalance_rel: 1.5}
 workers:
   - {name: prefill0, url: "http://127.0.0.1:8100", backend: vllm, role: prefill}
+  # max_inflight: decode admission cap; requests beyond it wait in the router before their prefill
   - {name: decode0,  url: "http://127.0.0.1:8200", backend: vllm, role: decode}

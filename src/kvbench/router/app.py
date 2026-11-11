@@ -16,6 +16,14 @@ Disaggregated mode (vLLM NixlConnector-style protocol):
   Mismatched ids leave every request's KV pinned on the prefiller until
   VLLM_NIXL_ABORT_REQUEST_TIMEOUT (120 s), which exhausts its KV pool within seconds.
 
+  Admission control (``max_inflight`` on decode workers): the decode worker is reserved
+  *before* the prefill leg, and a request waits in the router while every decoder is full.
+  Without it, an overloaded decoder queues requests whose KV the prefiller has already
+  computed and must keep pinned; that fills the prefiller's KV pool too, and past the abort
+  timeout the prefiller frees KV the decoder will still read (vLLM logs "Potentially invalid KV
+  blocks ... may have expired"). Measured on 1P1D vLLM: past ~32 sessions, a collapse instead
+  of queueing.
+
 Every response carries ``x-kvbench-*`` headers (chosen worker, routing reason,
 predicted prefix match, and in disagg mode the prefill-side cached-token count)
 so the benchmark client can attribute results without parsing logs.
@@ -56,9 +64,11 @@ _DISAGG_PREFILL_KV_PARAMS = {
 class Lease:
     """Router-side accounting for one request on one worker."""
 
-    def __init__(self, router: "Router", w: WorkerState, rr: RouteRequest, matched: int, est_prefill: float | None = None):
+    def __init__(self, router: "Router", w: WorkerState, rr: RouteRequest, matched: int, est_prefill: float | None = None,
+                 on_release=None):
         self.router = router
         self.w = w
+        self._on_release = on_release
         self.hashes = rr.hashes
         self.pred_frac = (matched / len(rr.hashes)) if rr.hashes else 0.0
         self.est_prefill = rr.est_prompt_tokens * (1.0 - self.pred_frac) if est_prefill is None else est_prefill
@@ -90,6 +100,8 @@ class Lease:
         self._released = True
         self.first_token()
         self.w.inflight -= 1
+        if self._on_release is not None:
+            self._on_release()
 
     def feedback(self, usage: dict | None) -> None:
         """Compare predicted vs reported cached fraction (prediction-quality telemetry)."""
@@ -129,6 +141,8 @@ class Router:
         self.decode_policy = make_policy(cfg.decode_policy, cfg.policy_params)
         self.client: httpx.AsyncClient | None = None
         self._telemetry_task: asyncio.Task | None = None
+        self._admit_lock = asyncio.Lock()        # FIFO queue of requests waiting for a decode slot
+        self._slot_freed = asyncio.Event()
         self.reset_stats()
 
     def reset_stats(self) -> None:
@@ -138,6 +152,9 @@ class Router:
         self.route_time_sum = 0.0
         self.matched_chunks_sum = 0
         self.prompt_chunks_sum = 0
+        self.admission_waits = 0              # requests that had to wait for a decode slot
+        self.admission_wait_s_sum = 0.0
+        self.admission_wait_s_max = 0.0
         for w in self.workers:
             w.routed_total = 0
             w.errors_total = 0
@@ -185,6 +202,51 @@ class Router:
         self.route_time_sum += time.perf_counter() - t0
         self.matched_chunks_sum += d.matched_chunks
         self.prompt_chunks_sum += len(rr.hashes)
+
+    # ---- disagg admission control ---------------------------------------------
+    @staticmethod
+    def _has_slot(w: WorkerState) -> bool:
+        return w.spec.max_inflight is None or w.admitted < w.spec.max_inflight
+
+    def _take_slot(self, rr: RouteRequest, free: list[WorkerState]) -> Decision:
+        d = self.decode_policy.select(rr, free)
+        d.worker.admitted += 1
+        return d
+
+    def _release_slot(self, w: WorkerState) -> None:
+        w.admitted -= 1
+        self._slot_freed.set()
+
+    async def _admit_decode(self, rr: RouteRequest) -> tuple[Decision | None, str]:
+        """Reserve a decode worker for the whole request, waiting (FIFO) while all are full.
+
+        Only waits when decode workers have ``max_inflight`` set. Returns (decision, "") or
+        (None, reason) if no decode worker is healthy or the wait exceeds request_timeout_s.
+        """
+        free = [w for w in self.pool("decode") if self._has_slot(w)]
+        if free and not self._admit_lock.locked():      # nobody queued ahead of us
+            return self._take_slot(rr, free), ""
+        t = time.perf_counter()
+        deadline = t + self.cfg.request_timeout_s
+        self.admission_waits += 1
+        async with self._admit_lock:                    # asyncio.Lock hands over in FIFO order
+            while True:
+                pool = self.pool("decode")
+                if not pool:
+                    return None, "no healthy prefill/decode workers"
+                free = [w for w in pool if self._has_slot(w)]
+                if free:
+                    waited = time.perf_counter() - t
+                    self.admission_wait_s_sum += waited
+                    self.admission_wait_s_max = max(self.admission_wait_s_max, waited)
+                    return self._take_slot(rr, free), ""
+                if time.perf_counter() > deadline:
+                    return None, "timed out waiting for a decode slot"
+                self._slot_freed.clear()
+                try:   # wake on a released slot; re-check health at least once a second
+                    await asyncio.wait_for(self._slot_freed.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
 
     async def _send(self, w: WorkerState, path: str, body: dict, headers: dict | None = None) -> httpx.Response:
         assert self.client is not None
@@ -278,8 +340,33 @@ class Router:
 
     async def _handle_disagg(self, body: dict, path: str, rr: RouteRequest, t0: float) -> Response:
         assert self.client is not None
-        pre_pool, dec_pool = self.pool("prefill"), self.pool("decode")
-        if not pre_pool or not dec_pool:
+        if not self.pool("prefill") or not self.pool("decode"):
+            self.errors_total += 1
+            return JSONResponse({"error": {"message": "no healthy prefill/decode workers"}}, status_code=503)
+
+        # 0) reserve the decode worker first (admission control, see module docstring), so the
+        #    prefiller never holds KV for a request no decoder can take yet
+        tq = time.perf_counter()
+        dd, why = await self._admit_decode(rr)
+        queue_ms = (time.perf_counter() - tq) * 1000.0
+        if dd is None:
+            self.errors_total += 1
+            return JSONResponse({"error": {"message": why}}, status_code=503)
+        lease_d = Lease(self, dd.worker, rr, dd.matched_chunks, est_prefill=0.0,
+                        on_release=lambda w=dd.worker: self._release_slot(w))
+        try:
+            return await self._disagg_legs(body, path, rr, t0, dd, lease_d, queue_ms)
+        except BaseException:
+            lease_d.release()   # idempotent; a cancelled or failed request must not keep its decode slot
+            raise
+
+    async def _disagg_legs(self, body: dict, path: str, rr: RouteRequest, t0: float, dd: Decision,
+                           lease_d: Lease, queue_ms: float) -> Response:
+        """Prefill then decode, after _admit_decode reserved ``dd``; lease_d is released by _relay."""
+        assert self.client is not None
+        pre_pool = self.pool("prefill")
+        if not pre_pool:
+            lease_d.release()
             self.errors_total += 1
             return JSONResponse({"error": {"message": "no healthy prefill/decode workers"}}, status_code=503)
 
@@ -303,12 +390,14 @@ class Router:
             presp = await self.client.post(pd.worker.spec.url.rstrip("/") + path, json=pbody, headers=req_headers)
         except httpx.TransportError as e:
             lease_p.release()
+            lease_d.release()
             pd.worker.errors_total += 1
             self.errors_total += 1
             return JSONResponse({"error": {"message": f"prefill failed: {e!r}"}}, status_code=502)
         lease_p.first_token()
         if presp.status_code >= 400:
             lease_p.release()
+            lease_d.release()
             pd.worker.errors_total += 1
             self.errors_total += 1
             return Response(content=presp.content, status_code=presp.status_code, media_type="application/json")
@@ -321,9 +410,7 @@ class Router:
         p_cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
         kvp = pj.get("kv_transfer_params")
 
-        # 2) decode
-        dd = self.decode_policy.select(rr, dec_pool)
-        lease_d = Lease(self, dd.worker, rr, dd.matched_chunks, est_prefill=0.0)
+        # 2) decode, on the worker reserved in step 0
         dbody = dict(body)
         if kvp:
             dbody["kv_transfer_params"] = kvp
@@ -345,6 +432,7 @@ class Router:
             "x-kvbench-prompt-chunks": str(len(rr.hashes)),
             "x-kvbench-prefill-ms": f"{prefill_ms:.3f}",
             "x-kvbench-request-id": req_headers["X-Request-Id"],
+            "x-kvbench-queue-ms": f"{queue_ms:.3f}",
         }
         if p_prompt is not None:
             headers["x-kvbench-prefill-prompt-tokens"] = str(p_prompt)
@@ -366,6 +454,11 @@ class Router:
             "reasons": dict(self.reasons),
             "route_time_ms_mean": 1000.0 * self.route_time_sum / n,
             "predicted_match_frac_mean": self.matched_chunks_sum / max(1, self.prompt_chunks_sum),
+            "admission": {
+                "waits": self.admission_waits,
+                "wait_s_mean": self.admission_wait_s_sum / max(1, self.admission_waits),
+                "wait_s_max": self.admission_wait_s_max,
+            },
             "workers": [w.to_dict() for w in self.workers],
         }
 
@@ -410,6 +503,7 @@ class Router:
             lines += [
                 f"kvbench_router_worker_routed_total{lbl} {w.routed_total}",
                 f"kvbench_router_worker_inflight{lbl} {w.inflight}",
+                f"kvbench_router_worker_admitted{lbl} {w.admitted}",
                 f"kvbench_router_worker_pending_prefill_tokens{lbl} {w.pending_prefill_tokens}",
                 f"kvbench_router_worker_index_chunks{lbl} {len(w.index)}",
                 f"kvbench_router_worker_healthy{lbl} {int(w.healthy)}",

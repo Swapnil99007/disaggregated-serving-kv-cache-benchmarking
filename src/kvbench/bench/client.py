@@ -60,6 +60,7 @@ class RequestResult:
     prefill_prompt_tokens: int | None = None
     prefill_cached_tokens: int | None = None
     prefill_ms: float | None = None
+    queue_ms: float | None = None      # disagg: time held in the router waiting for a decode slot
 
     @property
     def prefill_computed_tokens(self) -> int | None:
@@ -132,6 +133,8 @@ async def send_request(
             res.prefill_cached_tokens = _int_header(h, "x-kvbench-prefill-cached-tokens")
             pm = h.get("x-kvbench-prefill-ms")
             res.prefill_ms = float(pm) if pm else None
+            qm = h.get("x-kvbench-queue-ms")
+            res.queue_ms = float(qm) if qm else None
             if resp.status_code != 200:
                 body = (await resp.aread()).decode(errors="replace")
                 res.status, res.error = "error", f"HTTP {resp.status_code}: {body[:300]}"

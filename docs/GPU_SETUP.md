@@ -27,7 +27,7 @@ cd ~/llm-serving-benchmarking
 nvidia-smi                          # driver works?
 python3 --version                   # need >= 3.10
 python3 -m venv .venv && . .venv/bin/activate && pip install -e ".[gpu,dev]"
-pytest -q                           # sanity: 43 passed
+pytest -q                           # sanity: 46 passed
 ```
 
 ## 3. Docker path (VM clouds)

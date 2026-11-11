@@ -15,6 +15,10 @@ class WorkerSpec:
     backend: str = "vllm"            # vllm | sglang | sim
     role: str = "both"               # both | prefill | decode
     kv_capacity_tokens: int | None = None
+    # disagg decode workers only: admission cap. At most this many requests hold a slot on the
+    # worker (from before their prefill until their decode stream ends); the rest wait in the
+    # router, FIFO. None = unlimited. See Router._admit_decode.
+    max_inflight: int | None = None
     sim_config: str | None = None    # only used by the local launcher (`kvbench cluster`)
     sim_overrides: dict = field(default_factory=dict)
 
@@ -63,3 +67,8 @@ class RouterConfig:
                 raise ValueError(f"unknown backend {w.backend!r}")
             if w.role not in ("both", "prefill", "decode"):
                 raise ValueError(f"unknown role {w.role!r}")
+            if w.max_inflight is not None:
+                if w.role != "decode" or self.mode != "disagg":
+                    raise ValueError(f"{w.name}: max_inflight is only supported on decode workers in disagg mode")
+                if w.max_inflight < 1:
+                    raise ValueError(f"{w.name}: max_inflight must be >= 1")

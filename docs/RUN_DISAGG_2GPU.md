@@ -7,6 +7,14 @@ This runbook measures disaggregated serving on real hardware and compares it wit
 |---|---|---|---|
 | **A. Disaggregated (1P + 1D)** | prefill server: reads every prompt | decode server: writes every answer, pulling the KV over NIXL (staged through host memory, see below) | `results/vllm_disagg/<timestamp>` |
 | **B. Colocated (2 replicas)** | full replica 0 | full replica 1 | `results/vllm_2gpu/<timestamp>` |
+| **A2. Disaggregated + admission control** | as in A | as in A; the router lets at most 32 requests hold it | `results/vllm_disagg_ac/<timestamp>` |
+
+> **Why A2 exists.** In Phase A without a cap, 8–32 sessions ran cleanly but 48 and 64 sessions
+> collapsed: the decode instance's KV pool filled to 100% (at 32 sessions it peaked at ~77%),
+> the pipeline stalled until the client's 15-minute timeout, and KV the prefill instance had
+> held for over 120 s expired, so some decodes read KV blocks vLLM had already freed. A2
+> reruns 32–64 sessions with the router holding requests back once 32 are in flight on the
+> decode instance (`DECODE_MAX_INFLIGHT=32`), before their prefill starts.
 
 > **KV transfer path.** By default the KV is handed over **through host memory**
 > (`KV_PATH=staged`, which sets `UCX_TLS=tcp,cuda_copy`): each GPU only copies to and from its
@@ -23,7 +31,7 @@ vLLM 0.11.0, a KV cap of 8,192 blocks per instance, `--max-num-seqs 64`, and
 `--max-model-len 16384`. Both phases use `GPU_MEM_UTIL=0.80`. With the KV cache size fixed,
 that only sets memory headroom, not speed.
 
-**Budget: about 3 hours**: roughly $3.50 on 2× RTX A6000 or 2× RTX PRO 4000, and about $15 on 2× RTX PRO 6000.
+**Budget: about 3.5 hours**: roughly $4 on 2× RTX A6000 or 2× RTX PRO 4000, and about $15 on 2× RTX PRO 6000.
 
 | Step | Time |
 |---|---|
@@ -33,6 +41,7 @@ that only sets memory headroom, not speed.
 | 4. Phase A: start servers, verify, soak test, run the sweep | 65–85 min |
 | 5. Switch phases | 3 min |
 | 6. Phase B: start replicas, run the sweep | 45–60 min |
+| 6b. Phase A2: restart P/D with admission control, 9 runs | 25–35 min |
 | 7. Copy results home, terminate | 5 min |
 
 Commands below contain no `#` comments, so every block can be pasted as is. Run each block in
@@ -160,7 +169,7 @@ pytest -q
 df -h /
 ```
 
-Expected: **43 passed**, and `df` should show at least 15 GB still available.
+Expected: **46 passed**, and `df` should show at least 15 GB still available.
 
 ```bash
 kvbench gen-trace
@@ -295,7 +304,9 @@ restart `watch` afterwards):
 grep -c "Releasing expired KV blocks" logs/prefill.log
 ```
 
-This must stay **0**. Also check `nvidia-smi` in window 4: neither GPU may show `ERR!`. And
+This must stay **0** through 32 sessions. (Without the admission cap, the 48- and 64-session
+runs push the decode KV pool to 100% and this count climbs; that is the failure Phase A2
+measures the fix for.) Also check `nvidia-smi` in window 4: neither GPU may show `ERR!`. And
 window 3 should print a progress line (`... 100/1000 (10%)`) every couple of minutes.
 
 ## 5. Switch from Phase A to Phase B
@@ -361,13 +372,72 @@ the single-GPU results.
 kvbench bench --experiment configs/experiments/vllm_2gpu.yaml --policies round_robin
 ```
 
+## 6b. Phase A2: disaggregated again, with decode admission control
+
+**Stop Phase B** with **Ctrl-C** in window 0 (it stops both replicas and the router), then in
+windows 1 and 2 (the `tail`s). Window 4 should show both GPUs near 0 MiB.
+
+**Window 3 (`bench`):** get the router change, and move Phase A's logs aside so the restarted
+servers don't overwrite them:
+
+```bash
+cd /workspace/disaggregated-serving-kv-cache-benchmarking
+git pull
+git log --oneline -1
+mkdir -p logs/phaseA
+mv logs/prefill.log logs/decode.log logs/router_disagg.log logs/phaseA_diag.txt logs/phaseA/ 2>/dev/null; ls logs/phaseA
+```
+
+**Window 0 (`gpu0`):**
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh prefill
+```
+
+**Window 1 (`gpu1`):**
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh decode
+```
+
+Wait for `Application startup complete.` in both (faster than the first time: the weights are
+already downloaded).
+
+**Window 2 (`router`):**
+
+```bash
+. .venv/bin/activate
+DECODE_MAX_INFLIGHT=32 bash scripts/vllm_disagg_baremetal.sh router
+```
+
+It must print `decode admission cap (DECODE_MAX_INFLIGHT): 32`, then `router up: mode=disagg`.
+
+**Window 3 (`bench`):**
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh verify
+```
+
+Once it prints `VERIFY PASSED`, run the sweep (9 runs: 32, 48 and 64 sessions × 3 repeats):
+
+```bash
+kvbench bench --experiment configs/experiments/vllm_disagg_ac.yaml
+```
+
+It's finished when it prints `report: results/vllm_disagg_ac/<timestamp>/analysis/REPORT.md`.
+Every run should show `ok=1000/1000`, and this should stay **0** the whole time:
+
+```bash
+grep -c "Releasing expired KV blocks" logs/prefill.log
+```
+
 ## 7. Copy the results home, then terminate
 
 **Window 3 (`bench`):**
 
 ```bash
 cd /workspace/disaggregated-serving-kv-cache-benchmarking
-tar czf /tmp/pd_results.tgz results/vllm_disagg results/vllm_2gpu logs
+tar czf /tmp/pd_results.tgz results/vllm_disagg results/vllm_2gpu results/vllm_disagg_ac logs
 runpodctl send /tmp/pd_results.tgz
 ```
 
@@ -384,7 +454,7 @@ Wait for the Mac to finish receiving the file, then terminate the pod in the Run
 The combined comparison report is built from the received files:
 
 ```bash
-kvbench analyze results/vllm_2gpu/<ts> results/vllm_disagg/<ts> --baseline vllm-2gpu-2w/cache_aware --out results/compare_pd_gpu
+kvbench analyze results/vllm_2gpu/<ts> results/vllm_disagg/<ts> results/vllm_disagg_ac/<ts> --baseline vllm-2gpu-2w/cache_aware --out results/compare_pd_gpu
 ```
 
 ---

@@ -101,3 +101,67 @@ def test_disaggregated_end_to_end(port_factory):
     # (compare as sorted lists: with 3 concurrent sessions, decode legs can arrive in a different order)
     assert all(seen["p"]) and all(seen["d"]), "router must send X-Request-Id on both legs"
     assert sorted(seen["p"]) == sorted(seen["d"]) and len(set(seen["p"])) == 12
+
+
+def _track_concurrency(app, live: dict, peak: dict, key: str):
+    """ASGI wrapper: count /v1/ requests in flight, including the whole streamed body."""
+    async def asgi(scope, receive, send):
+        if scope["type"] != "http" or not scope["path"].startswith("/v1/"):
+            return await app(scope, receive, send)
+        live[key] += 1
+        peak[key] = max(peak[key], live[key])
+        try:
+            await app(scope, receive, send)
+        finally:
+            live[key] -= 1
+    return asgi
+
+
+def test_disagg_admission_control_caps_decode_inflight(port_factory):
+    # 6 sessions, decode capped at 2: requests wait in the router BEFORE their prefill leg, so
+    # neither engine ever sees more than 2 at once, and nothing fails
+    pp, pd, pr = port_factory(), port_factory(), port_factory()
+    workers = [WorkerSpec(name="p", url=f"http://127.0.0.1:{pp}", backend="sim", role="prefill"),
+               WorkerSpec(name="d", url=f"http://127.0.0.1:{pd}", backend="sim", role="decode", max_inflight=2)]
+    cfg = _router_cfg(workers, mode="disagg")
+    live, peak = {"p": 0, "d": 0}, {"p": 0, "d": 0}
+    sim_p = _track_concurrency(_sim(pp, "prefill"), live, peak, "p")
+    sim_d = _track_concurrency(_sim(pd, "decode"), live, peak, "d")
+    with ServerThread(sim_p, pp), ServerThread(sim_d, pd), ServerThread(create_router(cfg), pr):
+        url = f"http://127.0.0.1:{pr}"
+        results, _ = asyncio.run(run_closed_loop(group_conversations(_trace(24)), url, "kvbench-model", concurrency=6))
+        state = httpx.get(url + "/admin/state").json()
+    assert all(r.status == "ok" for r in results), [r.error for r in results if r.status != "ok"]
+    assert peak["d"] <= 2 and peak["p"] <= 2, peak
+    assert peak["d"] == 2                                  # the cap was actually reached
+    assert state["admission"]["waits"] > 0                 # ... and requests queued behind it
+    assert any(r.queue_ms and r.queue_ms > 0 for r in results)
+    d = next(w for w in state["workers"] if w["name"] == "d")
+    assert d["admitted"] == 0 and d["inflight"] == 0       # every slot was released
+
+
+def test_max_inflight_rejected_outside_disagg_decode():
+    import pytest
+    with pytest.raises(ValueError, match="max_inflight"):
+        RouterConfig(mode="colocated", workers=[WorkerSpec(name="w", url="http://x", max_inflight=4)]).validate()
+    with pytest.raises(ValueError, match="max_inflight"):
+        RouterConfig(mode="disagg", workers=[WorkerSpec(name="p", url="http://x", role="prefill", max_inflight=4),
+                                             WorkerSpec(name="d", url="http://y", role="decode")]).validate()
+
+
+def test_admission_slot_released_when_prefill_fails(port_factory):
+    # prefill worker unreachable: every request fails, but none may keep its decode slot
+    pp, pd, pr = port_factory(), port_factory(), port_factory()
+    workers = [WorkerSpec(name="p", url=f"http://127.0.0.1:{pp}", backend="sim", role="prefill"),
+               WorkerSpec(name="d", url=f"http://127.0.0.1:{pd}", backend="sim", role="decode", max_inflight=1)]
+    cfg = _router_cfg(workers, mode="disagg")
+    cfg.unhealthy_after_failures = 10_000          # keep "p" in the pool after it dies
+    sim_p = ServerThread(_sim(pp, "prefill"), pp)
+    with sim_p, ServerThread(_sim(pd, "decode"), pd), ServerThread(create_router(cfg), pr):
+        url = f"http://127.0.0.1:{pr}"
+        sim_p.__exit__(None, None, None)         # stop the prefill server
+        body = {"model": "kvbench-model", "prompt": "hello there", "max_tokens": 4}
+        codes = [httpx.post(url + "/v1/completions", json=body, timeout=30).status_code for _ in range(3)]
+        d = next(w for w in httpx.get(url + "/admin/state").json()["workers"] if w["name"] == "d")
+    assert codes == [502, 502, 502]                # with a leaked slot, call 2 would hang instead
+    assert d["admitted"] == 0 and d["inflight"] == 0

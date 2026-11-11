@@ -60,7 +60,7 @@ Requires Python ≥ 3.10.
 ```bash
 make install            # python3 -m venv .venv && pip install -e ".[dev,gpu]"
 source .venv/bin/activate
-make test               # 43 tests, including end-to-end router <-> simulator runs; ~10 s
+make test               # 46 tests, including end-to-end router <-> simulator runs; ~10 s
 ```
 
 ## 2. Run everything locally on the simulator (no GPU, no Docker)
