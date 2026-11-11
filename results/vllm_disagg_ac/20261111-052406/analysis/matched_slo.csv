@@ -1,0 +1,2 @@
+label,throughput_at_target,improvement_pct,improvement_pct_repeat_mean,improvement_pct_repeat_std,improvement_pct_repeat_ci95,repeats,note
+vllm-disagg-1p1d-ac32/cache_aware,4.98112122283321,0.0,0.0,0.0,0.0,2,ok

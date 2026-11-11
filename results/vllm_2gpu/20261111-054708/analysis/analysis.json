@@ -1,0 +1,117 @@
+{
+  "baseline": "vllm-2gpu-2w/cache_aware",
+  "labels": [
+    "vllm-2gpu-2w/cache_aware"
+  ],
+  "slo": {
+    "rows": [
+      {
+        "label": "vllm-2gpu-2w/cache_aware",
+        "throughput_at_target": 18.086267449452336,
+        "improvement_pct": 0.0,
+        "improvement_pct_repeat_mean": 0.0,
+        "improvement_pct_repeat_std": 0.0,
+        "improvement_pct_repeat_ci95": 0.0,
+        "repeats": 3,
+        "note": "ok"
+      }
+    ],
+    "target_s": 7.152794711846703,
+    "metric": "e2e_p95",
+    "auto_target": true,
+    "throughput_key": "steady_throughput_rps",
+    "baseline": "vllm-2gpu-2w/cache_aware"
+  },
+  "prefill": [
+    {
+      "label": "vllm-2gpu-2w/cache_aware",
+      "concurrency": 8,
+      "prompt_tokens": 3357721.0,
+      "computed": 736595.6666666666,
+      "computed_std": 17955.802330537426,
+      "ideal": 627100.0153367847,
+      "redundant": 109495.65132988198,
+      "hit_rate": 0.7806263037737006,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-2gpu-2w/cache_aware",
+      "concurrency": 16,
+      "prompt_tokens": 3357721.0,
+      "computed": 758206.3333333334,
+      "computed_std": 5301.877906302005,
+      "ideal": 627100.0153367847,
+      "redundant": 131106.31799654872,
+      "hit_rate": 0.774190192296104,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-2gpu-2w/cache_aware",
+      "concurrency": 24,
+      "prompt_tokens": 3357721.0,
+      "computed": 758627.6666666666,
+      "computed_std": 11624.309241126259,
+      "ideal": 627100.0153367847,
+      "redundant": 131527.65132988198,
+      "hit_rate": 0.7740647103595961,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-2gpu-2w/cache_aware",
+      "concurrency": 32,
+      "prompt_tokens": 3357721.0,
+      "computed": 778227.6666666666,
+      "computed_std": 5183.761311377419,
+      "ideal": 627100.0153367847,
+      "redundant": 151127.65132988198,
+      "hit_rate": 0.7682274177435627,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-2gpu-2w/cache_aware",
+      "concurrency": 48,
+      "prompt_tokens": 3357721.0,
+      "computed": 790254.3333333334,
+      "computed_std": 18960.10351589182,
+      "ideal": 627100.0153367847,
+      "redundant": 163154.31799654872,
+      "hit_rate": 0.7646456232267859,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-2gpu-2w/cache_aware",
+      "concurrency": 64,
+      "prompt_tokens": 3357721.0,
+      "computed": 801241.0,
+      "computed_std": 7515.096273501757,
+      "ideal": 627100.0153367847,
+      "redundant": 174140.98466321535,
+      "hit_rate": 0.761373562603921,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-2gpu-2w/cache_aware",
+      "concurrency": "all",
+      "prompt_tokens": 20146326.0,
+      "computed": 4623152.666666667,
+      "ideal": 3762600.092020708,
+      "redundant": 860552.5746459587,
+      "hit_rate": 0.7705213016672783,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    }
+  ]
+}

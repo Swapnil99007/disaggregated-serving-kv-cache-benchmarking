@@ -1,0 +1,4 @@
+label,throughput_at_target,improvement_pct,improvement_pct_repeat_mean,improvement_pct_repeat_std,improvement_pct_repeat_ci95,repeats,note
+vllm-2gpu-2w/cache_aware,18.086267449452336,0.0,0.0,0.0,0.0,3,ok
+vllm-disagg-1p1d-ac32/cache_aware,,,,,,0,target below every measured point
+vllm-disagg-1p1d/cache_aware,7.487704951233494,-58.60005403458619,-58.52792945759061,1.4424774701124954,3.5836018936455125,3,ok

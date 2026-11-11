@@ -1,0 +1,58 @@
+{
+  "config": {
+    "name": "vllm_disagg_ac",
+    "deployment": "vllm-disagg-1p1d-ac32",
+    "router_url": "http://localhost:8000",
+    "model": "kvbench-model",
+    "trace": {
+      "path": "traces/rag_1000.jsonl",
+      "workload": "configs/workloads/rag_default.yaml",
+      "max_prompts": 0
+    },
+    "policies": [
+      "cache_aware"
+    ],
+    "decode_policy": "least_loaded",
+    "concurrency": [
+      48,
+      64
+    ],
+    "repeats": 2,
+    "shuffle_policy_order": true,
+    "warmup": {
+      "engine_requests": 16,
+      "prefix_warmup_prompts": 0
+    },
+    "flush_between_runs": true,
+    "request": {
+      "ignore_eos": true,
+      "temperature": 0.0,
+      "timeout_s": 900,
+      "think_time_s": 0.0,
+      "extra_body": {}
+    },
+    "telemetry": {
+      "interval_s": 0.5,
+      "nvml": true
+    },
+    "ready_timeout_s": 1800,
+    "output_dir": "results",
+    "analysis": {
+      "baseline_policy": "cache_aware",
+      "slo_metric": "e2e",
+      "slo_percentile": 95,
+      "slo_target_s": null,
+      "chunk_chars": 256
+    }
+  },
+  "argv": [
+    "/workspace/disaggregated-serving-kv-cache-benchmarking/.venv/bin/kvbench",
+    "bench",
+    "--experiment",
+    "configs/experiments/vllm_disagg_ac.yaml",
+    "--concurrency",
+    "48,64",
+    "--repeats",
+    "2"
+  ]
+}

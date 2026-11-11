@@ -93,6 +93,25 @@ conversation to the same copy") did even better. The smarter balancing pays off 
 more copies, which the simulator shows with four. [Level 4](#45-what-the-results-mean) explains
 why.
 
+**A second experiment split the work across two GPUs.** One GPU (an NVIDIA A40) only reads
+prompts, and the other only writes answers. This is "disaggregated serving", explained in
+[2.8](#28-disaggregated-serving-briefly). It was compared with the ordinary setup on the same two
+GPUs, where each GPU runs a complete copy of the model:
+
+| | Split (read on one GPU, write on the other) vs a complete copy on each GPU |
+|---|---|
+| Requests served per second at the same worst-case response time | **59% fewer** (7.5 vs 18.1) |
+| Time until the first word, typical request, 32 users | 1.9 s instead of 0.11 s |
+| Time between words while the answer streams, 64 users | **2.4× faster** (9.8 ms vs 24 ms) |
+
+- **The split kept writing fast and steady, as the design promises.**
+- **On this hardware, the handoff was the problem.** After reading a prompt, the first GPU has to
+  pass the prompt's memory to the second GPU, and that only ran at about 0.2 GB/s. It took 1–1.6
+  seconds per request, compared with 0.1 seconds to read the prompt itself.
+- **Beyond 32 users, the split setup broke down.** The writing GPU's memory filled up, requests
+  hung for up to 15 minutes, and up to 64% of them failed. The project's fix was to make the
+  router hold requests back while the writing GPU is full. With the fix, every request succeeded.
+
 ---
 
 ## Level 2: The concepts
@@ -224,8 +243,9 @@ GPU pools**:
 - *decode workers* generate the tokens.
 
 This removes the interference. The costs are the KV transfer and the need to pick the right
-prefill-to-decode ratio. The project supports this mode (using vLLM's NixlConnector protocol) and
-studies it in the simulator.
+prefill-to-decode ratio. The project supports this mode (using vLLM's NixlConnector protocol),
+studies it in the simulator, and measures it on two real GPUs
+([4.6](#46-disaggregated-prefilldecode)).
 
 ---
 
@@ -629,7 +649,29 @@ sequenceDiagram
   `max_tokens = 1` for the reading step, `do_remote_decode = true`, and a shared `X-Request-Id`
   header.
 
-**Code:** `_handle_disagg()` in `src/kvbench/router/app.py`.
+**Admission control: don't start what can't be finished.** The writing server holds the memory of
+every conversation it is answering, so it can only take so many at once. On real GPUs, sending it
+more than about 32 at once filled its memory and stalled everything ([4.6](#46-disaggregated-prefilldecode)).
+So the router reserves a place on the writing server *before* the reading step starts. When all
+places are taken, the request waits in line at the router:
+
+```mermaid
+flowchart TD
+    A[Request arrives at the router] --> B{Free place on the writing server?<br/>at most 32 requests in progress}
+    B -- no --> W[Wait in line at the router<br/>first come, first served]
+    W --> B
+    B -- yes --> C[Reserve the place]
+    C --> D[Reading server reads the prompt<br/>and keeps its memory]
+    D --> E[Writing server fetches the memory<br/>and writes the answer]
+    E --> F[Answer finished: free the place]
+```
+
+The point is the order. A request waiting at the router holds no GPU memory anywhere. A request
+admitted too early would have its prompt read, and its memory parked on the reading server, with
+no writing server ready to take it. The limit is set per decode worker (`max_inflight`). Places are
+also released when a request fails or is cancelled, so a broken request can't hold one forever.
+
+**Code:** `_handle_disagg()` and `_admit_decode()` in `src/kvbench/router/app.py`.
 
 ### 3.8 Tests
 
@@ -829,7 +871,161 @@ staggered session starts, would remove this artifact.
 vLLM pre-allocates its KV pool at start-up. The useful memory signal is the engine's KV-usage
 percentage (the chart above), not the process's memory footprint.
 
-### 4.6 Disaggregated prefill/decode (simulator study)
+### 4.6 Disaggregated prefill/decode
+
+#### On two real GPUs
+
+**Setup.**
+- **Hardware:** RunPod, 2× NVIDIA A40 (48 GB, PCIe 4.0, no NVLink).
+- **Software:** vLLM 0.11.0 with NIXL 0.6.0.
+- **Same as [4.1](#41-experimental-setup-real-gpu):** the model (Qwen2.5-1.5B-Instruct), the
+  1,000-prompt trace, and the `cache_aware` router.
+- **Same engine settings for every server:** a KV cache of 8,192 blocks (131K tokens),
+  `--max-num-seqs 64`, `--max-model-len 16384`.
+
+Three configurations:
+
+| Configuration | GPU 0 | GPU 1 | Runs |
+|---|---|---|---|
+| **Colocated** (`vllm-2gpu-2w`) | complete replica | complete replica | 8–64 sessions × 3 repeats |
+| **1P+1D** (`vllm-disagg-1p1d`) | prefill | decode | 8–64 sessions × 3 repeats |
+| **1P+1D, capped** (`vllm-disagg-1p1d-ac32`) | prefill | decode; the router admits at most 32 requests at a time | 48 and 64 sessions × 2 repeats |
+
+> **The KV transfer path.** The KV cache goes from GPU 0 to GPU 1 *through host memory*: NIXL
+> over UCX with `UCX_TLS=tcp,cuda_copy`. The direct path, where the decode GPU reads the prefill
+> GPU's memory peer-to-peer (UCX `cuda_ipc`), took the decode GPU offline within about 30 s of
+> load. It showed `ERR!` in `nvidia-smi`, on two hosts whose GPUs sit behind PCIe bridges.
+> Everything below is measured on the staged path. Procedure: [RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md).
+
+**Throughput** (requests per second, steady state; mean of the repeats):
+
+| Sessions | Colocated | 1P+1D | 1P+1D, capped |
+|---:|---:|---:|---:|
+| 8 | **5.82** | 4.37 | |
+| 16 | **9.86** | 6.57 (0.07% errors) | |
+| 24 | **12.72** | 7.43 (0.07% errors) | |
+| 32 | **14.75** | 7.71 | |
+| 48 | **16.91** | collapsed: 25% errors | 4.98 (0 errors) |
+| 64 | **18.09** | collapsed: 64% errors | 2.85 (0 errors) |
+
+At a matched p95 end-to-end latency of 7.15 s, colocated serves 18.09 req/s and 1P+1D serves
+7.49 req/s: **59% less** (−58.5% ± 3.6% per repeat). Colocated had zero errors in all 18,000
+requests.
+
+**Latency** (medians; for 1P+1D at 48 and 64 sessions, the capped runs):
+
+| Sessions | TTFT p50, colocated | TTFT p50, 1P+1D | TPOT p50, colocated | TPOT p50, 1P+1D |
+|---:|---:|---:|---:|---:|
+| 8 | **0.079 s** | 0.326 s | **8.9 ms** | 9.5 ms |
+| 16 | **0.089 s** | 0.663 s | **10.6 ms** | 11.0 ms |
+| 24 | **0.095 s** | 1.193 s | 12.4 ms | **12.3 ms** |
+| 32 | **0.106 s** | 1.901 s | 14.4 ms | **13.1 ms** |
+| 48 | **0.124 s** | 4.92 s | 19.1 ms | **11.5 ms** |
+| 64 | **0.148 s** | 20.7 s | 24.0 ms | **9.8 ms** |
+
+![Colocated vs 1P+1D on 2x A40](images/pd_gpu_latency_vs_concurrency.png)
+
+*The three lines are colocated (blue), 1P+1D (orange) and 1P+1D with the admission cap (green).
+Orange shoots up at 48 and 64 sessions where it collapsed; green is the same setup with the cap.*
+
+**What the real-GPU results mean**
+
+**1. Disaggregation delivered its promise for decode.** TPOT stays at 9.5–13 ms at every load,
+because the decode GPU never processes a prompt. Colocated TPOT rises from 8.9 ms to 24 ms as
+prompt chunks share more decode steps (the interference from [2.2](#22-how-a-model-answers-prefill-then-decode)).
+Past 32 sessions, the split streams tokens 1.7–2.4× faster.
+
+**2. On this hardware, the KV handoff is the bottleneck.** The router timestamps each request's
+stages, which splits TTFT into its parts (first repeat):
+
+| Run | TTFT p50 | Waiting in the router | Prefill | KV handoff + first token |
+|---|---:|---:|---:|---:|
+| 1P+1D, 24 sessions | 1.16 s | 0 | 0.10 s | 1.04 s |
+| 1P+1D, 32 sessions | 1.78 s | 0 | 0.10 s | 1.65 s |
+| capped, 48 sessions | 5.27 s | 2.43 s | 0.10 s | 2.40 s |
+| capped, 64 sessions | 20.99 s | 11.14 s | 0.15 s | 10.41 s |
+
+The prefill itself takes 0.1 s. The handoff takes more than 10 times longer. The volume of KV moved can be
+read from the decode engine's counters: prompt tokens minus the tokens it already had in its own
+prefix cache, times 28,672 bytes per token (28 layers × 2 KV heads × 128 dimensions × K and V × 2
+bytes). It works out to:
+
+| | 8 sessions | 24–32 sessions | capped, 48 | capped, 64 |
+|---|---:|---:|---:|---:|
+| Decode GPU's own prefix-cache hit | 76% | 74–75% | 59–61% | 31–32% |
+| KV pulled per request | 24 MB | 24 MB | 38–40 MB | 66–67 MB |
+| Average transfer rate | 100 MB/s | 164–172 MB/s | 191 MB/s | 197–199 MB/s |
+
+The rate levels off just under **0.2 GB/s**. That is more than 100× below what a PCIe 4.0 ×16 link
+can carry (about 32 GB/s each way), and the simulator had assumed 25 GB/s. As load rises, the
+decode GPU's memory fills with running requests, so it keeps fewer conversation histories cached.
+That means more KV to pull per request, through the same narrow pipe. The arithmetic matches the
+measurements: 0.2 GB/s ÷ 66 MB per request ≈ 3.0 req/s predicted at 64 sessions, against 2.85
+measured.
+
+**3. Without admission control, overload causes a collapse, not a slowdown.** Peak KV usage on the
+decode GPU was:
+- 22–23% at 8 sessions;
+- 38–42% at 16;
+- 57–61% at 24;
+- 75–77% at 32;
+- **100%** at 48 and 64.
+
+Once it was full, a chain reaction followed:
+
+```mermaid
+flowchart LR
+    A[48+ sessions] --> B[Decode GPU's KV<br/>100% full]
+    B --> C[New requests queue<br/>on the decode GPU]
+    C --> D[Their KV stays parked<br/>on the prefill GPU]
+    D --> E[Prefill GPU's KV<br/>fills up too]
+    E --> F[Pipeline stalls]
+    F --> G[After 120 s vLLM frees<br/>KV nobody collected]
+```
+
+The logs show every step of it:
+- the prefill server released expired KV 128 times;
+- it logged "potentially invalid KV blocks … may have expired" 124 times. Those decodes read
+  blocks the prefill server had already freed, which may have been reused by then, so their
+  outputs may have been corrupted without any error;
+- requests stuck mid-handoff hung until the client's 15-minute timeout: exactly one per session,
+  48 or 64 per run;
+- the router's health checks timed out and marked the decode server unhealthy five times, for
+  88–113 s each. In those windows every request was rejected instantly, which explains most of
+  the errors.
+
+One 48-session run happened to survive (1,000/1,000, but at half the speed); the other two
+collapsed.
+
+**4. Admission control fixes the collapse, not the bandwidth.** With the router admitting at most
+32 requests to the decode GPU, decode KV peaked at 76–82%:
+- all 4,000 requests succeeded;
+- no KV expired;
+- the wait moved to the router queue: a median of 2.4 s at 48 sessions and 11 s at 64.
+
+The cap of 32 comes from the data: it is the highest tested load that never filled the decode
+GPU's memory.
+
+**5. With the same memory, 1P+1D has half the prefix cache.**
+- In the colocated setup, both GPUs' KV pools serve as prefix caches, 262K tokens in total.
+- In 1P+1D, the decode GPU's pool is busy holding running requests, so the prompt cache is
+  effectively the prefill GPU's 131K tokens.
+- The prefill-side hit rate held at about 75% up to 48 sessions, then fell to 46% at 64. The likely
+  reason: 64 conversations' histories don't fit in one cache, and conversations waiting in the
+  router queue get evicted before their next turn.
+
+**6. When would disaggregation win?** This experiment sits at the unfavourable corner, with a
+small model, cheap prefill and a slow KV link. Disaggregation pays off when:
+- the KV link is fast (NVLink or RDMA);
+- prefill is heavy (a larger model or longer prompts, so it interferes more with decode);
+- a TPOT target matters more than raw throughput.
+
+The measurements show both sides of that trade-off. The decode-side benefit is real (2.4× better
+TPOT at 64 sessions), and so is the cost when the handoff is slow.
+
+Full report: [results/compare_pd_gpu/REPORT.md](../results/compare_pd_gpu/REPORT.md).
+
+#### In the simulator
 
 This study uses the same four simulated GPUs, organized three ways: 4 colocated workers, 2 prefill
 + 2 decode (2P+2D), and 3 prefill + 1 decode (3P+1D). It used 400 prompts and one repeat, with the
@@ -854,9 +1050,10 @@ This study uses the same four simulated GPUs, organized three ways: 4 colocated 
 - **Cache-aware routing still matters in disaggregated mode.** On the prefill pool it raised the
   hit rate from 61.1% (round-robin, 2P+2D) to 72.5% (cumulative across concurrency levels).
 
-These results are from the simulator. The real vLLM disaggregated path (NixlConnector) is
-implemented, but it needs at least two GPUs and hasn't been measured yet. The step-by-step
-procedure is in [RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md).
+The simulator and the real GPUs agree on the direction of the trade-off: better TPOT, but worse
+TTFT and throughput for this prefill-heavy workload. The real run adds a cause the simulator
+didn't model. The simulator assumed a 25 GB/s KV link, while the real staged path delivered about
+0.2 GB/s.
 
 ### 4.7 Limitations and threats to validity
 
@@ -878,6 +1075,20 @@ procedure is in [RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md).
 - **Simulator results are relative.** They come from one repeat and a 400-prompt trace.
 - **The router is a single Python process.** Its overhead is the same for every policy, so the
   comparison is fair, but it is not a production data plane.
+- **The real disaggregation run used a slow KV path.** Host-staged transfers ran at about 0.2 GB/s,
+  because direct GPU-to-GPU reads were unsafe on these PCIe hosts. The 1P+1D vs colocated gap is
+  specific to that link; NVLink or RDMA would shrink it.
+- **A small model makes prefill cheap.** At 0.1 s per prompt, there is little prefill interference
+  for disaggregation to remove.
+- **The same KV budget per GPU** (8,192 blocks) gives 1P+1D half the prefix cache of the colocated
+  setup ([4.6](#46-disaggregated-prefilldecode), point 5). That is a fair memory comparison, but
+  not the only possible one.
+- **The capped 1P+1D runs have 2 repeats** and cover only 48 and 64 sessions. The cap of 32 was
+  chosen from this hardware's measurements; a budget counted in KV tokens would adapt to other
+  setups.
+- **The prefill server's cache flush failed between 1P+1D runs.** Blocks were still pinned for KV
+  transfers, so vLLM refused to reset its prefix cache. The effect looks negligible: the hit rate
+  (77.5%) matches the single-GPU runs (77.6–78.4%).
 
 ### 4.8 Next steps
 
@@ -888,9 +1099,12 @@ procedure is in [RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md).
 3. **A KV-cache-size sweep**, to plot routing benefit against cache pressure.
 4. **Open-loop (Poisson) arrivals**, alongside the closed loop, to remove the start-up burst and
    test bursty traffic.
-5. **Real disaggregation** with vLLM + NIXL on 2 GPUs, and an SGLang comparison on the same
-   hardware.
-6. **A real corpus** (for example, Wikipedia passages with a real retriever) instead of synthetic
+5. **Disaggregation on a fast interconnect** (NVLink or RDMA) and with a larger model, where the
+   KV handoff is cheap and prefill is heavy; plus direct timing of each NIXL transfer, and an
+   SGLang comparison.
+6. **A KV-token admission budget** for decode workers, instead of a fixed request count, so the cap
+   adapts to prompt length and cache size.
+7. **A real corpus** (for example, Wikipedia passages with a real retriever) instead of synthetic
    text.
 
 ### 4.9 Reproducing the results
@@ -909,6 +1123,9 @@ kvbench bench --experiment configs/experiments/vllm.yaml
 
 The full report for the run above is in
 [results/vllm/20261108-233332/analysis/REPORT.md](../results/vllm/20261108-233332/analysis/REPORT.md).
+
+The two-GPU disaggregation study ([4.6](#46-disaggregated-prefilldecode)) is reproduced
+step by step in [RUN_DISAGG_2GPU.md](RUN_DISAGG_2GPU.md).
 
 ---
 
@@ -933,6 +1150,10 @@ The full report for the run above is in
 | **Prefill–decode interference** | Decode steps slowing down because they share the GPU with prefill work |
 | **Disaggregated serving** | Separate GPU pools for prefill and decode, with the KV cache transferred between them |
 | **NIXL / NixlConnector** | NVIDIA's transfer library and vLLM's connector for moving KV blocks between engines |
+| **Colocated serving** | Every GPU runs a complete model copy that does both prefill and decode |
+| **1P+1D** | A disaggregated setup with one prefill GPU and one decode GPU |
+| **KV handoff** | Copying a prompt's KV cache from the prefill GPU to the decode GPU |
+| **Admission control** | Holding requests in a queue until the system has room for them, instead of overloading it |
 | **TTFT / TPOT / ITL / E2E** | Time to first token / time per output token / inter-token latency / end-to-end latency |
 | **p50 / p95** | Median / the value 95% of requests are at or below |
 | **Throughput** | Completed requests per second (steady state) |

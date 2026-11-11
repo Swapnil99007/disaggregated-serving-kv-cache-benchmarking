@@ -3,6 +3,8 @@
 This runbook measures disaggregated serving on real hardware and compares it with ordinary
 (colocated) serving **on the same two GPUs, with the same engine settings**.
 
+Results from running it on 2× A40: [PROJECT_EXPLAINED.md, section 4.6](PROJECT_EXPLAINED.md#46-disaggregated-prefilldecode).
+
 | Phase | GPU 0 | GPU 1 | Result folder |
 |---|---|---|---|
 | **A. Disaggregated (1P + 1D)** | prefill server: reads every prompt | decode server: writes every answer, pulling the KV over NIXL (staged through host memory, see below) | `results/vllm_disagg/<timestamp>` |

@@ -1,0 +1,117 @@
+{
+  "baseline": "vllm-disagg-1p1d/cache_aware",
+  "labels": [
+    "vllm-disagg-1p1d/cache_aware"
+  ],
+  "slo": {
+    "rows": [
+      {
+        "label": "vllm-disagg-1p1d/cache_aware",
+        "throughput_at_target": 7.712242734264638,
+        "improvement_pct": 0.0,
+        "improvement_pct_repeat_mean": 0.0,
+        "improvement_pct_repeat_std": 0.0,
+        "improvement_pct_repeat_ci95": 0.0,
+        "repeats": 3,
+        "note": "ok"
+      }
+    ],
+    "target_s": 97.56085040293789,
+    "metric": "e2e_p95",
+    "auto_target": true,
+    "throughput_key": "steady_throughput_rps",
+    "baseline": "vllm-disagg-1p1d/cache_aware"
+  },
+  "prefill": [
+    {
+      "label": "vllm-disagg-1p1d/cache_aware",
+      "concurrency": 8,
+      "prompt_tokens": 3357721.0,
+      "computed": 750542.3333333334,
+      "computed_std": 17821.10090127244,
+      "ideal": 627100.0153367847,
+      "redundant": 123442.31799654872,
+      "hit_rate": 0.7764726928373937,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-disagg-1p1d/cache_aware",
+      "concurrency": 16,
+      "prompt_tokens": 3355970.0,
+      "computed": 758727.3333333334,
+      "computed_std": 852.7674556016625,
+      "ideal": 627100.5635880341,
+      "redundant": 131626.76974529924,
+      "hit_rate": 0.7739170033313298,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-disagg-1p1d/cache_aware",
+      "concurrency": 24,
+      "prompt_tokens": 3355573.0,
+      "computed": 756922.3333333334,
+      "computed_std": 8077.382084149129,
+      "ideal": 627100.3046998356,
+      "redundant": 129822.02863349777,
+      "hit_rate": 0.7744296854170373,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-disagg-1p1d/cache_aware",
+      "concurrency": 32,
+      "prompt_tokens": 3357721.0,
+      "computed": 756377.0,
+      "computed_std": 4301.917711904774,
+      "ideal": 627100.0153367847,
+      "redundant": 129276.98466321535,
+      "hit_rate": 0.7747350062736005,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-disagg-1p1d/cache_aware",
+      "concurrency": 48,
+      "prompt_tokens": 2515052.3333333335,
+      "computed": 662689.6666666666,
+      "computed_std": 197524.49569947858,
+      "ideal": 627016.0540400115,
+      "redundant": 35673.612626655144,
+      "hit_rate": 0.7364930617222543,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    },
+    {
+      "label": "vllm-disagg-1p1d/cache_aware",
+      "concurrency": 64,
+      "prompt_tokens": 1195172.0,
+      "computed": 566436.0,
+      "computed_std": 592742.475160166,
+      "ideal": 626964.2278034686,
+      "redundant": -60528.22780346859,
+      "hit_rate": 0.6049932076043745,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": null
+    },
+    {
+      "label": "vllm-disagg-1p1d/cache_aware",
+      "concurrency": "all",
+      "prompt_tokens": 17137209.333333332,
+      "computed": 4251694.666666667,
+      "ideal": 3762381.180804919,
+      "redundant": 489313.48586174764,
+      "hit_rate": 0.7519027407574022,
+      "repeats": 3,
+      "total_prefill_reduction_pct": 0.0,
+      "redundant_prefill_reduction_pct": 0.0
+    }
+  ]
+}

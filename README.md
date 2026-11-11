@@ -51,6 +51,33 @@ simulation, affinity creates hotspots (load imbalance 1.40) and `cache_aware` le
 +16.9%. See [the explainer](docs/PROJECT_EXPLAINED.md#45-what-the-results-mean) for why, and the
 [full report](results/vllm/20261108-233332/analysis/REPORT.md) for every table and chart.
 
+### Disaggregated vs colocated on two real GPUs
+
+2× NVIDIA A40 (PCIe, no NVLink), vLLM 0.11.0 + NIXL 0.6.0, same model, trace and router.
+1 prefill + 1 decode instance (1P+1D) vs one complete replica per GPU, same KV budget per GPU.
+The KV cache moved between GPUs through host memory (`UCX_TLS=tcp,cuda_copy`), because direct
+GPU-to-GPU reads took the decode GPU offline on these PCIe hosts.
+
+| Sessions | Colocated (req/s) | 1P+1D (req/s) | TPOT p50, colocated | TPOT p50, 1P+1D |
+|---:|---:|---:|---:|---:|
+| 8 | **5.82** | 4.37 | **8.9 ms** | 9.5 ms |
+| 32 | **14.75** | 7.71 | 14.4 ms | **13.1 ms** |
+| 64 | **18.09** | 2.85 (with admission cap) | 24.0 ms | **9.8 ms** |
+
+- **Throughput:** colocated serves 59% more requests at matched p95 E2E latency (18.09 vs 7.49
+  req/s, ±3.6%).
+- **Decode stays fast in 1P+1D:** TPOT is 2.4× lower than colocated at 64 sessions, because the
+  decode GPU never processes prompts.
+- **The bottleneck is the KV handoff.** The staged path topped out near 0.2 GB/s. That is 1–1.6 s
+  per request, against 0.1 s of prefill.
+- **Without admission control, 48+ sessions collapse.** The decode KV pool fills (100%), requests
+  hang, KV the prefiller held past vLLM's 120 s timeout expires, and up to 64% of requests fail.
+- **The router fix:** capping in-flight decode requests at 32 (`max_inflight`) turned that into
+  queueing, with 0 errors in 4,000 requests.
+
+Details and caveats: [explainer 4.6](docs/PROJECT_EXPLAINED.md#46-disaggregated-prefilldecode),
+[comparison report](results/compare_pd_gpu/REPORT.md).
+
 ---
 
 ## 1. Setup
@@ -124,9 +151,13 @@ kvbench bench --experiment configs/experiments/sglang.yaml
 kvbench analyze results/vllm/<ts> results/sglang/<ts> --baseline vllm-2w/round_robin
 ```
 
-Disaggregated vLLM (2 GPUs): follow **[docs/RUN_DISAGG_2GPU.md](docs/RUN_DISAGG_2GPU.md)**
-(`scripts/vllm_disagg_baremetal.sh`, `configs/experiments/vllm_disagg.yaml` and the colocated
-baseline `configs/experiments/vllm_2gpu.yaml`), or use `docker/compose.vllm-disagg.yml`.
+Disaggregated vLLM (2 GPUs): follow **[docs/RUN_DISAGG_2GPU.md](docs/RUN_DISAGG_2GPU.md)**.
+It uses `scripts/vllm_disagg_baremetal.sh` with three experiment configs:
+- `configs/experiments/vllm_disagg.yaml`, the disaggregated run;
+- `configs/experiments/vllm_disagg_ac.yaml`, the same with decode admission control;
+- `configs/experiments/vllm_2gpu.yaml`, the colocated baseline.
+
+Alternatively, use `docker/compose.vllm-disagg.yml`.
 
 ---
 
@@ -191,7 +222,7 @@ tests/        unit + end-to-end tests (no GPU needed)
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/completions`, `POST /v1/chat/completions` | Routed inference (stream or not). Responses carry `x-kvbench-worker`, `-reason`, `-matched-chunks`, `-prompt-chunks`, and in disagg mode `-prefill-worker`, `-decode-worker`, `-prefill-cached-tokens`, `-prefill-ms` |
-| `GET /admin/state` | Policy, per-worker in-flight / pending prefill / KV usage / index size / prediction accuracy |
+| `GET /admin/state` | Policy, per-worker in-flight / admitted / pending prefill / KV usage / index size / prediction accuracy, decode admission-queue stats |
 | `POST /admin/policy` | `{"policy": "cache_aware", "params": {...}, "decode_policy": "least_loaded"}` |
 | `POST /admin/reset` | `{"flush_workers": true, "clear_index": true}`: clears the index and flushes engine prefix caches |
 | `GET /admin/worker_metrics` | Fresh scrape of every worker's `/metrics` |
@@ -206,3 +237,5 @@ tests/        unit + end-to-end tests (no GPU needed)
   so comparisons stay fair, but it is not a production data plane.
 - The simulator's cost model gives plausible *relative* costs only; validate on real GPUs before quoting absolute numbers.
 - vLLM's KV-connector API changes between releases; the disaggregated compose file is pinned and marked experimental.
+- The real-GPU disaggregation numbers use a host-staged KV path (~0.2 GB/s) on PCIe GPUs. They describe that
+  setup, not disaggregation over NVLink or RDMA.
