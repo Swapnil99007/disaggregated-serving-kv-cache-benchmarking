@@ -10,6 +10,15 @@
 #   bash scripts/vllm_disagg_baremetal.sh decode    # decode instance on GPU 1 (stays in foreground)
 #   bash scripts/vllm_disagg_baremetal.sh router    # waits for both instances, then runs the router
 #   bash scripts/vllm_disagg_baremetal.sh verify    # proves KV really moves between the GPUs
+#   bash scripts/vllm_disagg_baremetal.sh soak      # ~2 min of real load + GPU health check
+#
+# KV transfer path (KV_PATH):
+#   staged (default)  UCX_TLS=tcp,cuda_copy: each GPU only copies to/from host memory; the KV
+#                     crosses between engines through RAM. Works on any PCIe host.
+#   direct            UCX's default (cuda_ipc): the decode GPU READS the prefill GPU's memory
+#                     peer-to-peer. Fastest, but on hosts whose PCIe fabric mishandles P2P
+#                     reads it takes the reading GPU offline (nvidia-smi ERR!) within minutes.
+#                     Use only on hosts known to support it (e.g. NVLink-connected GPUs).
 #
 # Engine env (its own venv; pinned to the versions vLLM 0.11.0 was released with):
 #   python3 -m venv ~/vllm-env
@@ -39,6 +48,7 @@ DECODE_PORT=${DECODE_PORT:-9102}
 PREFILL_NIXL_PORT=${PREFILL_NIXL_PORT:-5600}   # NIXL handshake (side channel); unique per instance
 DECODE_NIXL_PORT=${DECODE_NIXL_PORT:-5601}
 ROUTER_PORT=${ROUTER_PORT:-8000}
+KV_PATH=${KV_PATH:-staged}
 LOG_DIR=${LOG_DIR:-logs}
 KV_CFG='{"kv_connector":"NixlConnector","kv_role":"kv_both"}'
 mkdir -p "$LOG_DIR"
@@ -147,6 +157,12 @@ serve() {   # serve <role> <gpu> <http port> <nixl port>
   [ -x "$VLLM_BIN" ] || { echo "ERROR: $VLLM_BIN not found; run the install step"; exit 1; }
   require_free "$port"
   require_free "$nixl_port"
+  case "$KV_PATH" in
+    staged) export UCX_TLS=${UCX_TLS:-tcp,cuda_copy} ;;
+    direct) ;;
+    *) echo "ERROR: KV_PATH must be 'staged' or 'direct' (got '$KV_PATH')"; exit 1 ;;
+  esac
+  echo "KV_PATH=$KV_PATH UCX_TLS=${UCX_TLS:-<ucx default>}" | tee "$LOG_DIR/kv_path_$role.txt"
   echo "starting the $role instance: GPU $gpu, HTTP :$port, NIXL handshake :$nixl_port"
   echo "log is also saved to $LOG_DIR/$role.log; Ctrl-C stops it"
   # shellcheck disable=SC2086
@@ -214,12 +230,29 @@ cmd_verify() {
   else echo; echo "VERIFY FAILED (see FAIL lines above)"; exit 1; fi
 }
 
+cmd_soak() {
+  local ok=1 n_err
+  echo "== GPU health before"
+  gpu_healthy || exit 1
+  echo "== about 2 minutes of real load: 400 prompts, 16 sessions (results/vllm_disagg_soak, not used in reports)"
+  "$KVBENCH_BIN" bench --experiment configs/experiments/vllm_disagg.yaml --max-prompts 400 \
+    --concurrency 16 --repeats 1 --name vllm_disagg_soak --no-analyze || ok=0
+  echo "== GPU health after"
+  gpu_healthy || ok=0
+  n_err=$(grep -c -E "Releasing expired KV blocks|unrecognized request" "$LOG_DIR/prefill.log" || true)
+  echo "== request-id mismatches / expired KV on the prefill instance: $n_err"
+  [ "${n_err:-0}" = 0 ] || ok=0
+  if [ "$ok" = 1 ]; then echo; echo "SOAK PASSED: safe to start the full sweep"
+  else echo; echo "SOAK FAILED (see above); don't start the sweep"; exit 1; fi
+}
+
 cmd_p2ptest() {
   local rc
   [ -x "$VLLM_PY" ] || { echo "ERROR: $VLLM_PY not found; run the install step"; exit 1; }
   echo "== GPU health before"
   gpu_healthy || exit 1
-  echo "== 45 s of copies GPU $PREFILL_GPU <-> GPU $DECODE_GPU (the same path NIXL uses; Ctrl-C is safe)"
+  echo "== 45 s of copies GPU $PREFILL_GPU <-> GPU $DECODE_GPU (peer WRITES only; it can't vouch for the"
+  echo "   peer READS that KV_PATH=direct uses, so keep the default KV_PATH=staged; Ctrl-C is safe)"
   set +e
   CUDA_VISIBLE_DEVICES=$PREFILL_GPU,$DECODE_GPU timeout 150 "$VLLM_PY" - <<'EOF'
 import time
@@ -263,9 +296,10 @@ EOF
 case "${1:-}" in
   check)   cmd_check ;;
   p2ptest) cmd_p2ptest ;;
+  soak)    cmd_soak ;;
   prefill) serve prefill "$PREFILL_GPU" "$PREFILL_PORT" "$PREFILL_NIXL_PORT" ;;
   decode)  serve decode "$DECODE_GPU" "$DECODE_PORT" "$DECODE_NIXL_PORT" ;;
   router)  cmd_router ;;
   verify)  cmd_verify ;;
-  *) echo "usage: bash $0 {check|p2ptest|prefill|decode|router|verify}"; exit 2 ;;
+  *) echo "usage: bash $0 {check|p2ptest|prefill|decode|router|verify|soak}"; exit 2 ;;
 esac

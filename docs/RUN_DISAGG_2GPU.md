@@ -5,8 +5,17 @@ This runbook measures disaggregated serving on real hardware and compares it wit
 
 | Phase | GPU 0 | GPU 1 | Result folder |
 |---|---|---|---|
-| **A. Disaggregated (1P + 1D)** | prefill server: reads every prompt | decode server: writes every answer, pulling the KV over NIXL | `results/vllm_disagg/<timestamp>` |
+| **A. Disaggregated (1P + 1D)** | prefill server: reads every prompt | decode server: writes every answer, pulling the KV over NIXL (staged through host memory, see below) | `results/vllm_disagg/<timestamp>` |
 | **B. Colocated (2 replicas)** | full replica 0 | full replica 1 | `results/vllm_2gpu/<timestamp>` |
+
+> **KV transfer path.** By default the KV is handed over **through host memory**
+> (`KV_PATH=staged`, which sets `UCX_TLS=tcp,cuda_copy`): each GPU only copies to and from its
+> own host RAM. The direct path (`KV_PATH=direct`) has the decode GPU *read* the prefill GPU's
+> memory peer-to-peer. On two different RunPod hosts (2× A40, then 2× A6000, both with GPUs
+> behind PCIe bridges), that took the decode GPU offline (`nvidia-smi` showed `ERR!`) within
+> about 30 seconds of sweep load, even though the system reported peer access as available.
+> Use `direct` only on GPUs known to support it, such as NVLink-connected ones. Staged transfers
+> add tens of milliseconds per cold prompt, so report the path along with the results.
 
 Both phases replay the same 1,000-prompt trace at 8–64 sessions with 3 repeats, using the
 `cache_aware` router. The engine settings match the single-GPU runs: Qwen2.5-1.5B-Instruct,
@@ -19,9 +28,9 @@ that only sets memory headroom, not speed.
 | Step | Time |
 |---|---|
 | 1. Rent the pod | 10 min |
-| 2. Install, pre-flight check, GPU-to-GPU test | 20–25 min |
+| 2. Install and pre-flight check | 20–25 min |
 | 3. Open the tmux windows | 2 min |
-| 4. Phase A: start servers, verify, run the sweep | 60–80 min |
+| 4. Phase A: start servers, verify, soak test, run the sweep | 65–85 min |
 | 5. Switch phases | 3 min |
 | 6. Phase B: start replicas, run the sweep | 45–60 min |
 | 7. Copy results home, terminate | 5 min |
@@ -170,23 +179,12 @@ Expected: **`ALL CHECKS PASSED`**. It checks:
 - the router has the request-ID fix;
 - all five ports are free.
 
-The "peer access" line is informational. Write down whether it says True or False; it matters
-only if step 4's verify fails.
+The "peer access" line is informational. With the default staged KV path, GPU-to-GPU access
+isn't used at all.
 
-Then stress-test the GPU-to-GPU path. That's the same path NIXL uses, and some hosts report peer
-access as True but can't sustain the traffic. It takes about 1 minute:
-
-```bash
-bash scripts/vllm_disagg_baremetal.sh p2ptest
-```
-
-What the result means:
-- **`P2P TEST PASSED`**: continue normally.
-- **`P2P TEST FAILED`, but no GPU shows `ERR!`**: continue, but start the prefill and decode
-  servers in step 4 with the UCX fallback (`UCX_TLS=tcp,cuda_copy`, see
-  [Troubleshooting](#troubleshooting)).
-- **A GPU shows `ERR!`**: that host is broken. Terminate the pod and deploy another. On the next
-  pod, skip this test and use the UCX fallback from the start.
+`bash scripts/vllm_disagg_baremetal.sh p2ptest` exists for anyone trying `KV_PATH=direct`. It
+only exercises peer *writes*, though, and it passed on both hosts whose GPUs later failed under
+peer *reads*. So it can't vouch for the direct path. Skip it with the default path.
 
 ## 3. Open the tmux windows
 
@@ -266,8 +264,19 @@ It checks four things:
 - the decode server's log reports `num_successful_transfers` above 0;
 - the prefill server logged no request-ID mismatches.
 
-**Don't start the sweep until verify passes.** If it fails, see
+**Don't continue until verify passes.** If it fails, see
 [Troubleshooting](#troubleshooting).
+
+Then run about 2 minutes of real load (400 prompts at 16 sessions), followed by a GPU health
+check. Both earlier GPU failures happened within 30 seconds of load like this, so this is where
+you find out, not an hour into the sweep. Still in **window 3**:
+
+```bash
+bash scripts/vllm_disagg_baremetal.sh soak
+```
+
+It must end with **`SOAK PASSED: safe to start the full sweep`**. Its results go to
+`results/vllm_disagg_soak/` and aren't used in any report.
 
 Then, still in **window 3**, run the sweep (18 runs, about 50–70 minutes):
 
@@ -398,10 +407,10 @@ runpodctl send /tmp/diag.txt
 | `ERROR: port ... is already in use` | A leftover server or router | `pkill -f vllm-env; pkill -f "kvbench router"`, then retry |
 | A server window exits with a traceback | Usually NIXL/UCX setup, or CUDA-graph capture with the connector | Collect diagnostics. Then try the eager fallback below |
 | verify: `prefill instance returned no KV-transfer info` | The connector isn't active on the prefill server | Check that window 0 printed `NIXL is available`. If not, fix the NIXL install |
-| verify: no `KV Transfer metrics` line | Transfers failing, or the stats line hasn't been printed yet | Wait 30 s and run `grep "KV Transfer metrics" logs/decode.log`. If still nothing, try the UCX fallback below |
+| verify: no `KV Transfer metrics` line | Transfers failing, or the stats line hasn't been printed yet | Wait 30 s and run `grep "KV Transfer metrics" logs/decode.log`. If still nothing, collect diagnostics; check that windows 0 and 1 printed `KV_PATH=staged UCX_TLS=tcp,cuda_copy` |
 | `Releasing expired KV blocks` in `logs/prefill.log` | Prefill and decode disagree on request IDs, so the prefill server holds every request's KV for 120 s and stalls | Make sure `check` passed the router check (`git pull`), then restart the router |
 | Sweep requests time out | Usually the row above, or a crashed server | Check windows 0 and 1, then collect diagnostics |
-| Sweep stalls: no progress line for 5+ min, decode log shows `Running: N reqs` with `generation throughput: 0.0`, and `nvidia-smi` shows **`ERR!`** on a GPU | That GPU stopped responding (hardware fault, or a host that can't sustain GPU-to-GPU traffic). The pod can't recover | Save logs (`nvidia-smi -q -i 1 > logs/gpu1_state.txt`, then send `logs/` home), terminate, deploy a new pod, and run `p2ptest` there before anything else |
+| Sweep stalls: no progress line for 5+ min, decode log shows `Running: N reqs` with `generation throughput: 0.0`, and `nvidia-smi` shows **`ERR!`** on a GPU | That GPU stopped responding. This is the known failure of `KV_PATH=direct` on PCIe hosts (peer reads); otherwise a hardware fault. The pod can't recover | Terminate, deploy a new pod, and use the default `KV_PATH=staged` |
 
 **Eager fallback.** Use this if a server dies while capturing CUDA graphs. It turns off CUDA
 graphs, so it must be applied to **both phases**, or the comparison isn't fair:
@@ -416,16 +425,15 @@ Use the same prefix for `decode`, and in Phase B:
 VLLM_EXTRA_ARGS="--num-gpu-blocks-override 8192 --enforce-eager" GPU_MEM_UTIL=0.80 VLLM_BIN=~/vllm-env/bin/vllm N=2 GPUS=0,1 bash scripts/vllm_baremetal.sh
 ```
 
-**UCX fallback.** Use this if verify shows no transfers, or the logs mention UCX transport errors,
-especially when `check` reported peer access as False. It stages the KV through host memory
-over TCP: slower, but it doesn't need direct GPU-to-GPU access. Restart prefill and decode with:
+**Transfer path.** The default is `KV_PATH=staged` (through host memory). To try the direct
+peer-to-peer path, on NVLink-connected GPUs only, start both servers with `KV_PATH=direct`:
 
 ```bash
-UCX_TLS=tcp,cuda_copy bash scripts/vllm_disagg_baremetal.sh prefill
+KV_PATH=direct bash scripts/vllm_disagg_baremetal.sh prefill
 ```
 
-and the same prefix for `decode`. Record this setting with the results, because it makes KV
-transfers slower than direct GPU-to-GPU copies.
+Use the same prefix for `decode`. Each server window prints which path it's using, and the
+choice is also saved to `logs/kv_path_prefill.txt` and `logs/kv_path_decode.txt`.
 
 **Stop-loss.** If Phase A still fails after about 45 minutes of trying:
 1. collect diagnostics;
